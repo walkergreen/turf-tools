@@ -36,6 +36,13 @@ export const auth = betterAuth({
   // OTP send/verify tracing is in the hooks below — BA itself doesn't log
   // around those.
   logger: { level: "info" },
+  // Browsers reaching the app through a tunnel or proxy present an origin
+  // other than BETTER_AUTH_URL, which the library would reject. Extra origins
+  // are listed comma-separated in AUTH_TRUSTED_ORIGINS.
+  trustedOrigins: (process.env.AUTH_TRUSTED_ORIGINS ?? "")
+    .split(",")
+    .map((origin) => origin.trim())
+    .filter((origin) => origin.length > 0),
   session: {
     // 30 days with sliding renewal (default updateAge = 1 day): any device
     // active at least monthly never re-logs-in; anything idle a month dies.
