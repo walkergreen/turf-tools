@@ -3,6 +3,7 @@
 // generic (mapping-driven) importers need runtime config.
 export const AVAILABLE_IMPORTERS = [
   { name: "nys_voter_file", label: "New York State Voter File" },
+  { name: "targetsmart", label: "TargetSmart" },
 ] as const;
 
 export type ImporterName = (typeof AVAILABLE_IMPORTERS)[number]["name"];

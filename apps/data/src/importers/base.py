@@ -21,6 +21,8 @@ from urllib.parse import urlsplit, urlunsplit
 from pydantic import BaseModel, ConfigDict, model_validator
 from pydantic.alias_generators import to_camel
 
+from src.models import Person
+
 if TYPE_CHECKING:
     import duckdb
     from src.models import TableRef
@@ -188,3 +190,24 @@ class Importer(Protocol):
         conn: duckdb.DuckDBPyConnection,
         progress: Progress,
     ) -> TableRef: ...
+
+
+def validate_persons_table(fqn: str, conn: duckdb.DuckDBPyConnection) -> None:
+    """Check that the table at `fqn` carries every `Person` column and that a
+    sample of its rows passes the model.
+
+    Required-subset, not exact-match: `persons_validated` must contain the
+    Person core, but also carries the dataset's extra filterable columns
+    (described by the manifest), which `Person` ignores. Raises `ValueError`
+    naming the missing columns or the first failing row.
+    """
+    rel = conn.table(fqn)
+    missing = set(Person.model_fields) - set(rel.columns)
+    if missing:
+        raise ValueError(f"persons_validated missing columns required by Person: {sorted(missing)}")
+    columns = rel.columns
+    for i, row in enumerate(rel.limit(100).fetchall()):
+        try:
+            Person.model_validate(dict(zip(columns, row, strict=True)))
+        except Exception as e:
+            raise ValueError(f"Row {i} failed Person validation: {e}") from e

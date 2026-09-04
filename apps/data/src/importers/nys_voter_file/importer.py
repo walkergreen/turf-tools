@@ -15,18 +15,16 @@ import os
 from typing import TYPE_CHECKING
 
 import duckdb
-from src.importers.base import SourceUnreadableError, redact_source
+from src.importers.base import SourceUnreadableError, redact_source, validate_persons_table
 from src.importers.nys_voter_file.decode import decode_txt_to_table
 from src.importers.nys_voter_file.manifest import NYS_MANIFEST
 from src.importers.nys_voter_file.transform import nys_sboe_transformation_query
 from src.importers.nys_voter_file.voting_history import parse_voting_history
-from src.models import Person, TableRef
+from src.models import TableRef
 from src.tables import PERSON_CATALOG, ensure_schema, table_fqn
 
 if TYPE_CHECKING:
     from src.importers.base import Manifest, Progress
-
-_EXPECTED_COLUMNS = set(Person.model_fields.keys())
 
 
 def _current_version(conn: duckdb.DuckDBPyConnection) -> int:
@@ -144,7 +142,7 @@ class NysVoterFileImporter:
 
         # 4. Validate the result carries the Person-required columns + a sample of
         #    rows through the model. Extra (manifest) columns are allowed.
-        self._validate(validated_fqn, conn)
+        validate_persons_table(validated_fqn, conn)
         progress.advance()
 
         return TableRef(
@@ -153,20 +151,3 @@ class NysVoterFileImporter:
             table="persons_validated",
             version=_current_version(conn),
         )
-
-    @staticmethod
-    def _validate(fqn: str, conn: duckdb.DuckDBPyConnection) -> None:
-        rel = conn.table(fqn)
-        # Required-subset, not exact-match: `persons_validated` must contain the
-        # Person core, but also carries the dataset's extra filterable columns
-        # (described by the manifest), which are legitimately present.
-        missing = _EXPECTED_COLUMNS - set(rel.columns)
-        if missing:
-            raise ValueError(f"persons_validated missing columns required by Person: {sorted(missing)}")
-        columns = rel.columns
-        for i, row in enumerate(rel.limit(100).fetchall()):
-            try:
-                # Person ignores the extra columns; only the required core is validated.
-                Person.model_validate(dict(zip(columns, row, strict=True)))
-            except Exception as e:
-                raise ValueError(f"Row {i} failed Person validation: {e}") from e

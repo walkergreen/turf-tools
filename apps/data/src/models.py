@@ -86,7 +86,7 @@ class Person(BaseModel):
     dataset has (enrollment, districts, voting history, …); those are described
     by the importer's `Manifest` and are not modeled here. `assembly` carries
     every such column into `persons_geocoded` generically, so adding a field
-    needs no pipeline change — hence `_validate` checks these columns are
+    needs no pipeline change — hence `validate_persons_table` checks these columns are
     *present* (a subset), not that they're the *only* columns. Extra fields are
     plain top-level columns (fast: Parquet pruning + Bloom filters); there is no
     catch-all JSON blob — the manifest is the performant equivalent.
