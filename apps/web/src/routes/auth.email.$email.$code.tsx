@@ -69,8 +69,8 @@ function VerifyPage() {
   if (!error && !requireConfirmation) return null;
 
   return (
-    <div className="flex min-h-screen items-center justify-center px-4">
-      <div className="fixed top-3 right-4 flex items-center gap-3">
+    <div className="relative flex min-h-screen items-center justify-center px-4">
+      <div className="absolute top-3 right-4 flex items-center gap-3">
         <LoadingIndicator />
         <LightDarkToggle />
       </div>

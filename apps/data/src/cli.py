@@ -1,8 +1,10 @@
 """CLI entrypoints for the data package."""
 
 import argparse
+import glob
 import os
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from hamilton import driver
 
@@ -21,12 +23,14 @@ from src.derived import compute_derived_metadata
 from src.duckdb import OPERATIONAL_PG_ALIAS, attach_operational_postgres, get_connection
 from src.import_progress import NullProgress
 from src.importers.nys_voter_file import NysVoterFileImporter
+from src.importers.registry import IMPORTERS, get_importer
 from src.models import TableRef, quote_ident
 from src.perf import TimingHook
 from src.quickwit import ensure_index, persons_index_id
 from src.settings import get_settings
 from src.tables import (
     PERSON_CATALOG,
+    dataset_version_schema,
     ensure_schema,
     finalize_version,
     schema_fqn,
@@ -34,6 +38,9 @@ from src.tables import (
 from src.tables import (
     drop_schema as _drop_schema_helper,
 )
+
+if TYPE_CHECKING:
+    from src.importers.base import Importer
 
 
 def _render(dr: driver.Driver, filename: str) -> None:
@@ -72,10 +79,16 @@ def update_visualizations() -> None:
 # ---------------------------------------------------------------------------
 
 
-# Dataset-version schema the dev seed writes into (slug `nys_voter_file`, v1).
-# `seed-persons` creates the matching dataset row and activates it for the seeded
-# orgs; `resolve_version` resolves an org to it.
+# Dataset-version schema the dev seed writes into by default (slug
+# `nys_voter_file`, v1). `seed-persons` creates the matching dataset row and
+# activates it for the seeded orgs; `resolve_version` resolves an org to it.
 _DEFAULT_SCHEMA = "nys_voter_file_v1"
+
+# Display name of the dataset row the dev seed creates for each importer.
+_SEED_DATASET_NAMES = {
+    "nys_voter_file": "NY State Voter File",
+    "targetsmart": "TargetSmart Voter File",
+}
 
 
 def seed_boundaries() -> None:
@@ -86,22 +99,33 @@ def seed_boundaries() -> None:
     where persons tagged with each distinct key live. Output goes to the
     dataset-version schema, alongside `persons_geocoded`, `buildings_geocoded`.
 
-    Requires ``seed-persons`` to have run first. Pair `--schema` here with
-    whatever you passed to `seed-persons` if you used a non-default schema:
+    Requires ``seed-persons`` to have run first. Pair `--importer` and
+    `--schema` here with whatever you passed to `seed-persons`:
 
-        uv run seed-boundaries --schema nys_voter_file_v1
+        uv run seed-boundaries --importer targetsmart --schema targetsmart_v1
     """
     parser = argparse.ArgumentParser(prog="seed-boundaries", description=seed_boundaries.__doc__)
     parser.add_argument(
+        "--importer",
+        choices=sorted(IMPORTERS),
+        default=NysVoterFileImporter.name,
+        help=f"Importer whose manifest names the key groups to derive (default: {NysVoterFileImporter.name!r}).",
+    )
+    parser.add_argument(
         "--schema",
-        default=_DEFAULT_SCHEMA,
-        help=f"Dataset-version schema to read persons from (default: {_DEFAULT_SCHEMA!r}).",
+        default=None,
+        help="Dataset-version schema to read persons from (default: '<importer>_v1').",
     )
     args = parser.parse_args()
+    schema = args.schema or dataset_version_schema(args.importer, 1)
 
+    # One boundary table per key group the importer's manifest declares; the
+    # field's `column` is the key expression.
     key_group_sources = [
-        {"key_group": "nyc_eds", "key_expression": "precinct"},
-        {"key_group": "nyc_zips", "key_expression": "zip5"},
+        {"key_group": fd.key_group, "key_expression": fd.column}
+        for section in get_importer(args.importer)().manifest().fields
+        for fd in section
+        if fd.key_group is not None and fd.column is not None
     ]
 
     settings = get_settings()
@@ -115,7 +139,7 @@ def seed_boundaries() -> None:
     # Persons table referenced by FQN — must already exist (seed_persons output).
     persons_ref = TableRef(
         catalog=PERSON_CATALOG,
-        schema=args.schema,
+        schema=schema,
         table="persons_geocoded",
         version=0,
     )
@@ -126,7 +150,7 @@ def seed_boundaries() -> None:
         "tiger_county_fips": settings.tiger_county_fips,
         "tiger_data_dir": settings.tiger_data_dir,
         "persons_geocoded": persons_ref,
-        "schema": args.schema,
+        "schema": schema,
         "conn": conn,
     }
 
@@ -221,12 +245,12 @@ def reset_ducklake(include_geo: bool = False) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Seed persons: load the NYC sample voter file → transform to Person schema
+# Seed persons: load a voter file → transform to Person schema
 # → geocode against TIGER blockfaces → aggregate into buildings/doors.
 # ---------------------------------------------------------------------------
 
 
-def _ensure_seed_dataset(conn: duckdb.DuckDBPyConnection, schema: str) -> str:
+def _ensure_seed_dataset(conn: duckdb.DuckDBPyConnection, schema: str, importer_name: str) -> str:
     """Dev seed: create the dataset + v1 row this DuckLake schema backs and grant
     it to every seeded org, returning the version id. This is what an import would
     write to Postgres, minus the UI — `db:mock` no longer creates it, so a clean
@@ -239,7 +263,7 @@ def _ensure_seed_dataset(conn: duckdb.DuckDBPyConnection, schema: str) -> str:
     conn.execute(
         f"CALL postgres_execute('{pg}', $ft$"
         f"INSERT INTO app.datasets (slug, name, importer) "
-        f"VALUES ('{slug}', 'NY State Voter File', 'nys_voter_file') "
+        f"VALUES ('{slug}', '{_SEED_DATASET_NAMES.get(importer_name, importer_name)}', '{importer_name}') "
         f"ON CONFLICT (slug) DO NOTHING$ft$)"
     )
     dataset_id = conn.execute(f"SELECT dataset_id FROM {pg}.app.datasets WHERE slug = ?", [slug]).fetchone()[0]
@@ -275,12 +299,14 @@ def _activate_for_all_orgs(conn: duckdb.DuckDBPyConnection, version_id: str) -> 
 def seed_persons() -> None:
     """Import a voter file → geocode → aggregate into buildings/doors.
 
-    Writes into the dataset-version schema (default `nys_voter_file_v1`, the
-    dataset the mock seeds and the seeded orgs resolve to). `--source` takes a
-    path or URL; override the target with `--schema`:
+    Writes into the dataset-version schema (default `<importer>_v1`, e.g.
+    `nys_voter_file_v1` — the dataset the mock seeds and the seeded orgs resolve
+    to). `--importer` picks the importer from the registry; `--source` takes a
+    path, glob, or URL; override the target with `--schema`:
 
         uv run seed-persons --source fixtures/ny-voters-10k-sample.parquet
         uv run seed-persons --source https://example.com/voters.parquet --schema nys_voter_file_v1
+        uv run seed-persons --importer targetsmart --source ~/exports/targetsmart/part-*.parquet
 
     Pass `--reset` to drop the schema first so the next run rebuilds every
     table from scratch (intermediate DAG nodes are incremental, so a pipeline
@@ -302,9 +328,15 @@ def seed_persons() -> None:
         help="Path or URL of the voter file to seed from (parquet, CSV, or the raw fixed-width .txt).",
     )
     parser.add_argument(
+        "--importer",
+        choices=sorted(IMPORTERS),
+        default=NysVoterFileImporter.name,
+        help=f"Importer to load the source with (default: {NysVoterFileImporter.name!r}).",
+    )
+    parser.add_argument(
         "--schema",
-        default=_DEFAULT_SCHEMA,
-        help=f"Target dataset-version schema (default: {_DEFAULT_SCHEMA!r}).",
+        default=None,
+        help="Target dataset-version schema (default: '<importer>_v1', e.g. 'nys_voter_file_v1').",
     )
     parser.add_argument(
         "--reset",
@@ -317,6 +349,7 @@ def seed_persons() -> None:
         help="Print per-node wall time as the pipeline runs, plus a sorted summary at the end.",
     )
     args = parser.parse_args()
+    schema = args.schema or dataset_version_schema(args.importer, 1)
 
     settings = get_settings()
     conn = get_connection(settings)
@@ -327,28 +360,35 @@ def seed_persons() -> None:
 
     # Create the dataset/version rows the pipeline fills (grant them to the seeded
     # orgs). Activation waits until the pipeline finishes — see below.
-    version_id = _ensure_seed_dataset(conn, args.schema)
+    version_id = _ensure_seed_dataset(conn, schema, args.importer)
 
     if args.reset:
-        print(f"Dropping schema {schema_fqn(args.schema)}…")
-        _drop_schema_helper(conn, args.schema)
-        ensure_schema(conn, args.schema)
+        print(f"Dropping schema {schema_fqn(schema)}…")
+        _drop_schema_helper(conn, schema)
+        ensure_schema(conn, schema)
 
+    # `glob` rather than a plain existence test: a Parquet export may be
+    # addressed as `part-*.parquet`, which the importer hands to DuckDB as-is.
     source = os.path.expanduser(args.source)
-    if "://" not in source and not Path(source).exists():
+    if "://" not in source and not glob.glob(source, recursive=True):
         print(f"Voter file not found at {source}.")
         return
 
-    print(f"Seeding persons from {source} (schema={args.schema})…")
+    print(f"Seeding persons from {source} (schema={schema})…")
     print(f"  TIGER counties: {settings.tiger_county_fips} (cache: {settings.tiger_data_dir})")
-    if settings.voter_zip5_filter:
+    if args.importer == NysVoterFileImporter.name and settings.voter_zip5_filter:
         print(f"  Voter ZIP5 filter (dev scope): {settings.voter_zip5_filter}")
 
     # Import the voter file (source → persons_validated) outside Hamilton, then
-    # run the shared pipeline from that seam. Fixture is already NYC-only so no
-    # county filter; `voter_zip5_filter` scopes dev runs to a small slice.
-    importer = NysVoterFileImporter(zip5_filter=settings.voter_zip5_filter)
-    persons_validated = importer.load(source, args.schema, conn, NullProgress())
+    # run the shared pipeline from that seam. The NYS importer takes the dev
+    # ZIP5 slice as instance config (the fixture is already NYC-only, so no
+    # county filter); every other importer is constructed without arguments.
+    importer: Importer
+    if args.importer == NysVoterFileImporter.name:
+        importer = NysVoterFileImporter(zip5_filter=settings.voter_zip5_filter)
+    else:
+        importer = get_importer(args.importer)()
+    persons_validated = importer.load(source, schema, conn, NullProgress())
 
     timing = TimingHook() if args.timing else None
     builder = driver.Builder().with_modules(
@@ -371,7 +411,7 @@ def seed_persons() -> None:
         ],
         inputs={
             "persons_validated": persons_validated,
-            "schema": args.schema,
+            "schema": schema,
             "tiger_year": settings.tiger_year,
             "tiger_state_fips": settings.tiger_state_fips,
             "tiger_county_fips": settings.tiger_county_fips,
