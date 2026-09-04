@@ -13,6 +13,12 @@ export default defineConfig({
   server: {
     port: 3000,
     host: "0.0.0.0",
+    // Hostnames a reverse proxy or tunnel may present, comma-separated in
+    // WEB_ALLOWED_HOSTS; the dev server rejects any other non-local Host.
+    allowedHosts: (process.env.WEB_ALLOWED_HOSTS ?? "")
+      .split(",")
+      .map((host) => host.trim())
+      .filter((host) => host.length > 0),
   },
   ssr: {
     noExternal: ["@turf-tools/db", "@electric-sql/pglite"],
