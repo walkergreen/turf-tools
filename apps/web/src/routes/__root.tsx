@@ -14,6 +14,7 @@ import { type QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { createStore, Provider as JotaiProvider } from "jotai";
 
 import { Shell } from "~/components/shell";
+import { SiteNotice } from "~/components/site-notice";
 import { __registerNotifyStore } from "~/lib/notify";
 import { getSession } from "~/lib/server/session";
 import { detectDisplayTimezone } from "~/lib/timezones";
@@ -172,6 +173,7 @@ function RootDocument({ children }: Readonly<{ children: ReactNode }>) {
         <HeadContent />
       </head>
       <body>
+        <SiteNotice />
         {children}
         <Scripts />
       </body>
