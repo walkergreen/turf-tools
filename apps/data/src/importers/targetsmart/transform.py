@@ -106,6 +106,21 @@ def _text(col: str) -> str:
     return f"nullif(trim(CAST(raw.{col} AS VARCHAR)), '')"
 
 
+def county_fips_sql(columns: list[str]) -> str:
+    """SQL deriving the optional 3-digit `county_fips` from TargetSmart's county
+    code: `vb_vf_county_code` (the Census county FIPS code within
+    `vb_vf_reg_state`, exported without zero-padding — 61 for New York County,
+    5 for the Bronx), falling back to `vb_tsmart_county_code` when the extract
+    carries it. A 1–3 digit numeric code is zero-padded to three digits;
+    anything else (a name, blank, NULL) yields NULL so scope resolution falls
+    back to the whole state."""
+    sources = [_text("vb_vf_county_code")]
+    if "vb_tsmart_county_code" in columns:
+        sources.append(_text("vb_tsmart_county_code"))
+    code = f"coalesce({', '.join(sources)})" if len(sources) > 1 else sources[0]
+    return f"CASE WHEN {code} ~ '^[0-9]{{1,3}}$' THEN lpad({code}, 3, '0') END"
+
+
 def _case_from_map(expr: str, mapping: dict[str, str], default: str, null_passthrough: bool) -> str:
     """SQL CASE mapping `expr`'s values via `mapping`; unmatched values take
     `default`. With `null_passthrough`, a NULL input stays NULL instead of
@@ -233,6 +248,7 @@ SELECT
     {iso_date_sql("vb_vf_registration_date")} AS registration_date,
     {registration_status} AS registration_status,
     {_text("vb_vf_county_code")} AS county_code,
+    {county_fips_sql(columns)} AS county_fips,
     -- Named `precinct_id`, not `precinct`: the web's text-multi editor rewrites
     -- values of a field keyed `precinct` into the NYC `AA-EEE` form.
     {_text("vb_vf_precinct_id")} AS precinct_id,

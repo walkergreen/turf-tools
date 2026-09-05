@@ -12,6 +12,8 @@ which are filterable. There is no catch-all JSON blob.
 
 from __future__ import annotations
 
+from src.importers.nys_voter_file.counties import county_fips_sql
+
 # NYS raw → canonical mappings used by the SQL CASE expressions below.
 # Keys are NYS-specific codes; values are cross-state canonical labels.
 
@@ -161,6 +163,9 @@ SELECT
     {_case_from_map("raw.status", NYS_REGISTRATION_STATUS_LABELS, default="unknown")} AS registration_status,
     {_iso_date_sql("raw.last_voted_date")} AS last_voted_date,
     raw.county_code AS county_code,
+    -- Census county FIPS for the geographic scope (see `src/geo/scope.py`);
+    -- the BOE code itself stays in `county_code` for the County filter.
+    {county_fips_sql("raw.county_code")} AS county_fips,
     -- `precinct` is the smallest political unit. NYC uses the
     -- "AA-EEE" assembly+election composite; bare election_district is
     -- meaningless across assembly districts.

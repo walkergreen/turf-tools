@@ -18,16 +18,26 @@ if TYPE_CHECKING:
     from src.importers.base import Manifest
 
 
-def compute_derived_metadata(conn: duckdb.DuckDBPyConnection, geocoded_fqn: str, manifest: Manifest) -> dict[str, Any]:
+def compute_derived_metadata(
+    conn: duckdb.DuckDBPyConnection,
+    geocoded_fqn: str,
+    manifest: Manifest,
+    *,
+    geo_scope: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Derive all cached properties for a freshly-built version. `geocoded_fqn`
     is the persons_geocoded table; `manifest` drives what's derivable. Callers
-    read `rowCount` back from the result (it replaces a separate count query)."""
+    read `rowCount` back from the result (it replaces a separate count query).
+    `geo_scope` is the `scope_metadata` block describing which TIGER counties,
+    OSM extracts, and UTM zone the version was built against."""
     derived: dict[str, Any] = {
         "rowCount": conn.execute(f"SELECT count(*) FROM {geocoded_fqn}").fetchone()[0],
     }
     elections = _read_elections(conn, geocoded_fqn, manifest)
     if elections is not None:
         derived["elections"] = elections
+    if geo_scope is not None:
+        derived["geoScope"] = geo_scope
     return derived
 
 

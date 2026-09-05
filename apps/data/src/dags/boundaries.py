@@ -32,6 +32,7 @@ Geometry is pre-simplified at `DEFAULT_SIMPLIFY_TOLERANCE` (0.0001° ≈
 """
 
 import duckdb
+from src.geo.scope import CountyScope, scope_sql
 from src.models import TableRef
 from src.tables import PERSON_CATALOG, ensure_schema, table_fqn
 
@@ -93,8 +94,7 @@ def boundary_from_geojson(
 def boundary_from_blocks(
     persons_geocoded: TableRef,
     tiger_tabblock_raw: TableRef,
-    tiger_state_fips: str,
-    tiger_county_fips: list[str],
+    geo_scope: list[CountyScope],
     key_group: str,
     key_expression: str,
     schema: str,
@@ -139,7 +139,8 @@ def boundary_from_blocks(
     backfilling so polygons don't extend across rivers, the harbor,
     Central Park's reservoir, etc.
 
-    Tabblock rows are filtered to the configured state/county scope on
+    Tabblock rows are filtered to this dataset version's resolved scope
+    (`geo_scope`, the (state, county) pairs it was geocoded against) on
     read: the shared tabblock table is an accumulating download cache and
     may hold counties from previous, wider imports. Without the filter,
     every out-of-scope land block backfills onto the nearest in-scope
@@ -149,8 +150,7 @@ def boundary_from_blocks(
     fqn = table_fqn(schema, key_group)
     persons_fqn = persons_geocoded.fqn
     tabblock_fqn = tiger_tabblock_raw.fqn
-    counties_sql_list = ", ".join(f"'{c}'" for c in tiger_county_fips)
-    tabblock_scope = f"state_fips = '{tiger_state_fips}' AND county_fips IN ({counties_sql_list})"
+    tabblock_scope = scope_sql(geo_scope)
 
     conn.execute(f"DROP TABLE IF EXISTS {fqn}")
     conn.execute(f"""

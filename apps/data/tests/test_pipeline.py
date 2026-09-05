@@ -31,6 +31,7 @@ from hamilton import driver
 
 import duckdb
 from src.dags import aggregate, assembly, geocode, matching, osm, tiger
+from src.geo.scope import CountyScope
 from src.import_progress import NullProgress
 from src.importers.nys_voter_file import NysVoterFileImporter
 
@@ -109,11 +110,14 @@ def nyc_pipeline(tiger_cache_dir, osm_cache_dir):
                 "persons_validated": persons_validated,
                 "schema": "default",
                 "tiger_year": "2024",
-                "tiger_state_fips": "36",
-                # All five NYC counties — matches the seed-persons default.
-                "tiger_county_fips": ["061", "005", "047", "081", "085"],
+                # All five NYC counties, pinned rather than derived so the
+                # golden numbers do not depend on scope resolution.
+                "geo_scope": [CountyScope("36", c) for c in ("061", "005", "047", "081", "085")],
                 "tiger_data_dir": tiger_cache_dir,
-                "osm_url": ("https://download.geofabrik.de/north-america/us/new-york-260501.osm.pbf"),
+                "osm_url_template": "https://download.geofabrik.de/north-america/us/{state}-latest.osm.pbf",
+                "osm_url_pins": {},
+                # The pinned snapshot the cached ~500 MB fixture was built from.
+                "osm_urls": ["https://download.geofabrik.de/north-america/us/new-york-260501.osm.pbf"],
                 "osm_data_dir": osm_cache_dir,
                 "conn": conn,
             },

@@ -1,5 +1,7 @@
 """CLI entrypoints for the data package."""
 
+from __future__ import annotations
+
 import argparse
 import glob
 import os
@@ -21,6 +23,8 @@ from src.dags import (
 )
 from src.derived import compute_derived_metadata
 from src.duckdb import OPERATIONAL_PG_ALIAS, attach_operational_postgres, get_connection
+from src.geo.scope import format_scope, scope_metadata, scope_spec_from_settings
+from src.geo.tiger_scope import county_match_rate_warnings, resolve_tiger_scope, scope_source
 from src.import_progress import NullProgress
 from src.importers.nys_voter_file import NysVoterFileImporter
 from src.importers.registry import IMPORTERS, get_importer
@@ -40,7 +44,9 @@ from src.tables import (
 )
 
 if TYPE_CHECKING:
+    from src.geo.scope import CountyScope
     from src.importers.base import Importer
+    from src.settings import Settings
 
 
 def _render(dr: driver.Driver, filename: str) -> None:
@@ -116,6 +122,7 @@ def seed_boundaries() -> None:
         default=None,
         help="Dataset-version schema to read persons from (default: '<importer>_v1').",
     )
+    _add_tiger_scope_arg(parser)
     args = parser.parse_args()
     schema = args.schema or dataset_version_schema(args.importer, 1)
 
@@ -144,11 +151,13 @@ def seed_boundaries() -> None:
         version=0,
     )
 
+    # `persons_geocoded` carries the importer's `state` / `county_fips` columns
+    # through, so the scope resolves from it exactly as the import did.
+    geo_scope = _resolve_scope(conn, settings, persons_ref, args.tiger_scope)
     base_inputs = {
         "tiger_year": settings.tiger_year,
-        "tiger_state_fips": settings.tiger_state_fips,
-        "tiger_county_fips": settings.tiger_county_fips,
         "tiger_data_dir": settings.tiger_data_dir,
+        "geo_scope": geo_scope,
         "persons_geocoded": persons_ref,
         "schema": schema,
         "conn": conn,
@@ -296,6 +305,44 @@ def _activate_for_all_orgs(conn: duckdb.DuckDBPyConnection, version_id: str) -> 
     )
 
 
+def _add_tiger_scope_arg(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--tiger-scope",
+        default=None,
+        help=(
+            "Pin the geographic scope for this run, overriding TIGER_SCOPE "
+            "(e.g. '36:005,047,061,081,085' or '36:*'). Default: settings, else derived from the data."
+        ),
+    )
+
+
+def _resolve_scope(
+    conn: duckdb.DuckDBPyConnection,
+    settings: Settings,
+    persons: TableRef,
+    override: str | None,
+    notes: list[str] | None = None,
+) -> list[CountyScope]:
+    """Resolve and print the (state, county) scope for `persons`, honoring a
+    `--tiger-scope` override ahead of settings. Warnings are printed and, when
+    `notes` is given, collected there for the version's geoScope metadata."""
+    spec, _ = (override, "settings") if override else scope_spec_from_settings(settings)
+
+    def warn(message: str) -> None:
+        print(message)
+        if notes is not None:
+            notes.append(message)
+
+    geo_scope = resolve_tiger_scope(
+        conn, persons, spec=spec, tiger_year=settings.tiger_year, tiger_data_dir=settings.tiger_data_dir, warn=warn
+    )
+    print(f"  TIGER scope: {format_scope(geo_scope)} (cache: {settings.tiger_data_dir})")
+    osm_warning = osm.osm_url_scope_warning(geo_scope, settings.osm_url, settings.osm_urls)
+    if osm_warning:
+        warn(osm_warning)
+    return geo_scope
+
+
 def seed_persons() -> None:
     """Import a voter file → geocode → aggregate into buildings/doors.
 
@@ -348,6 +395,7 @@ def seed_persons() -> None:
         action="store_true",
         help="Print per-node wall time as the pipeline runs, plus a sorted summary at the end.",
     )
+    _add_tiger_scope_arg(parser)
     args = parser.parse_args()
     schema = args.schema or dataset_version_schema(args.importer, 1)
 
@@ -375,7 +423,6 @@ def seed_persons() -> None:
         return
 
     print(f"Seeding persons from {source} (schema={schema})…")
-    print(f"  TIGER counties: {settings.tiger_county_fips} (cache: {settings.tiger_data_dir})")
     if args.importer == NysVoterFileImporter.name and settings.voter_zip5_filter:
         print(f"  Voter ZIP5 filter (dev scope): {settings.voter_zip5_filter}")
 
@@ -389,6 +436,8 @@ def seed_persons() -> None:
     else:
         importer = get_importer(args.importer)()
     persons_validated = importer.load(source, schema, conn, NullProgress())
+    scope_notes: list[str] = []
+    geo_scope = _resolve_scope(conn, settings, persons_validated, args.tiger_scope, scope_notes)
 
     timing = TimingHook() if args.timing else None
     builder = driver.Builder().with_modules(
@@ -408,21 +457,29 @@ def seed_persons() -> None:
             "geocoding_summary",
             "buildings_geocoded",
             "doors_geocoded",
+            "utm_epsg",
+            "osm_pbfs",
         ],
         inputs={
             "persons_validated": persons_validated,
+            "geo_scope": geo_scope,
             "schema": schema,
             "tiger_year": settings.tiger_year,
-            "tiger_state_fips": settings.tiger_state_fips,
-            "tiger_county_fips": settings.tiger_county_fips,
             "tiger_data_dir": settings.tiger_data_dir,
+            "osm_url_template": settings.osm_url_template,
+            "osm_url_pins": settings.osm_url_pins,
+            "osm_urls": settings.osm_urls,
             "osm_url": settings.osm_url,
             "osm_data_dir": settings.osm_data_dir,
             "conn": conn,
         },
     )
+    print(f"  UTM zone: EPSG:{result['utm_epsg']}; OSM extracts: {[osm.extract_id(p) for p in result['osm_pbfs']]}")
 
     geocoded_ref = result["persons_geocoded"]
+    for message in county_match_rate_warnings(conn, geocoded_ref.fqn):
+        print(f"  {message}")
+        scope_notes.append(message)
     summary_ref = result["geocoding_summary"]
     buildings_ref = result["buildings_geocoded"]
     doors_ref = result["doors_geocoded"]
@@ -450,7 +507,20 @@ def seed_persons() -> None:
     # activate it for the seeded orgs — only now that the data exists, so a
     # crash mid-pipeline never leaves an org pointing at an empty dataset.
     manifest = importer.manifest()
-    derived = compute_derived_metadata(conn, geocoded_ref.fqn, manifest)
+    configured_spec, configured_source = scope_spec_from_settings(settings)
+    derived = compute_derived_metadata(
+        conn,
+        geocoded_ref.fqn,
+        manifest,
+        geo_scope=scope_metadata(
+            geo_scope,
+            source="settings" if args.tiger_scope else scope_source(configured_spec, configured_source),
+            tiger_year=settings.tiger_year,
+            osm_extracts=[osm.extract_id(p) for p in result["osm_pbfs"]],
+            utm_epsg=result["utm_epsg"],
+            notes=scope_notes,
+        ),
+    )
     finalize_version(conn, settings, version_id, manifest, derived)
     _activate_for_all_orgs(conn, version_id)
     person_count = derived["rowCount"]

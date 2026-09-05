@@ -36,10 +36,24 @@ export type DatasetVersionStatus = "importing" | "ready" | "failed";
 // the data server's `finalize_version` alongside `manifest`. `rowCount` is the
 // person count; `elections` backs the voting-history-detail filter's picker.
 // `bit` is the election's position in the persons table's mask columns, which
-// the data server's filter compiler maps selections through.
+// the data server's filter compiler maps selections through. `geoScope` records
+// the reference data the version was geocoded against: the TIGER counties per
+// state (and whether that scope was pinned by settings or derived from the
+// data), the OSM extracts ingested, the UTM zone used for metric geometry, and
+// `notes` — the warnings the import raised while resolving and checking the
+// scope (a state widened to every county, persons outside a pinned scope, a
+// county that barely matched TIGER).
 export type DerivedMetadata = {
   rowCount?: number;
   elections?: { value: string; label: string; bit?: number }[];
+  geoScope?: {
+    source: "settings" | "legacy" | "derived";
+    tigerYear: string;
+    states: { fips: string; postal: string; counties: string[] }[];
+    osmExtracts: string[];
+    utmEpsg: number | null;
+    notes?: string[];
+  };
 };
 
 // An immutable, retained version of a dataset. Never deleted, so any pinned

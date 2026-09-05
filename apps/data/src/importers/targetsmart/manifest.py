@@ -34,8 +34,11 @@ TARGETSMART_MANIFEST = Manifest(
                 key_group="nyc_zips",
                 key_group_label="ZIP codes",
             ),
-            # Open-valued: `vb_vf_county_code` follows TargetSmart's own county
-            # coding, so no curated catalog — the user types the codes.
+            # `vb_vf_county_code` is the 3-digit Census county FIPS code within the
+            # registration state (NY: 061 New York, 047 Kings, 081 Queens, 005 Bronx,
+            # 085 Richmond; NJ: 003 Bergen), the same code `transform.county_fips_sql`
+            # zero-pads into `county_fips` for scope resolution. Open-valued here —
+            # no curated catalog, the user types the codes.
             FieldDef(column="county_code", label="County", filter_kind="text-multi"),
             FieldDef(
                 column="gender",

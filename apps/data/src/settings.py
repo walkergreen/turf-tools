@@ -1,7 +1,10 @@
 import os
+from typing import Annotated, Self
 
-from pydantic import Field
-from pydantic_settings import BaseSettings
+from pydantic import Field, field_validator, model_validator
+from pydantic_settings import BaseSettings, NoDecode
+
+from src.geo.scope import parse_scope_spec, scope_spec_from_settings
 
 
 def _default_database_url() -> str:
@@ -69,27 +72,66 @@ class Settings(BaseSettings):
     ducklake_prefix: str = Field(default="ducklake", description="Key prefix for the person lake.")
     ducklake_geo_prefix: str = Field(default="ducklake-geo", description="Key prefix for the geo lake.")
 
-    # TIGER download settings
+    # TIGER download settings. The geographic scope (which states/counties to
+    # load) is resolved per dataset version by `src/geo/scope.py`: an explicit
+    # `TIGER_SCOPE` pins it for the deployment; otherwise the legacy
+    # `TIGER_STATE_FIPS` + `TIGER_COUNTY_FIPS` pair does (both required, and
+    # not read at all once `TIGER_SCOPE` is set); otherwise it is derived from
+    # the `state` / `county_fips` columns of the imported data. A pin is
+    # deployment-wide — every dataset imported here geocodes against it — so
+    # it must be removed or extended before a dataset from another state is
+    # imported; the import job warns when persons fall outside it.
     tiger_year: str = Field(
         default="2024",
         description="TIGER/Line vintage year to download.",
     )
-    tiger_state_fips: str = Field(
-        default="36",
-        description="State FIPS code for TIGER data (e.g. 36 for New York).",
+    tiger_scope: str | None = Field(
+        default=None,
+        description=(
+            "Pinned geographic scope: ';'-separated `STATE:COUNTIES` entries, e.g. "
+            "`36:005,047,061,081,085;34:017`, with `36:*` (or a bare `36`) for statewide. "
+            "States accept FIPS or postal codes. Unset → derive the scope from the imported data."
+        ),
     )
-    tiger_county_fips: list[str] = Field(
-        # All five NYC counties: New York (Manhattan), Bronx, Kings (Brooklyn),
-        # Queens, Richmond (Staten Island). Matches the
-        # `ny-voters-2026-03-08-10k-sample` seed fixture so geocoding has
-        # TIGER coverage for every borough out of the box.
-        default=["061", "005", "047", "081", "085"],
-        description="County FIPS codes within the state (e.g. 061 for New York County/Manhattan).",
+    tiger_state_fips: str | None = Field(
+        default=None,
+        description=(
+            "Single-state pin used when TIGER_SCOPE is unset: the state FIPS code (e.g. 36). "
+            "Requires TIGER_COUNTY_FIPS; for the whole state set TIGER_SCOPE=36:* instead. "
+            "Not read when TIGER_SCOPE is set."
+        ),
+    )
+    tiger_county_fips: list[str] | None = Field(
+        default=None,
+        description=(
+            'County FIPS codes (JSON array, e.g. ["061","005"]) within TIGER_STATE_FIPS. '
+            "Only read alongside TIGER_STATE_FIPS when TIGER_SCOPE is unset; the two are set together."
+        ),
     )
     tiger_data_dir: str = Field(
         default="./tiger_cache",
         description="Local directory to cache downloaded TIGER shapefiles.",
     )
+
+    @field_validator("tiger_scope")
+    @classmethod
+    def _validate_tiger_scope(cls, value: str | None) -> str | None:
+        """Fail at startup on a malformed TIGER_SCOPE; blank means unset."""
+        if value is None or value.strip() == "":
+            return None
+        parse_scope_spec(value)
+        return value
+
+    @model_validator(mode="after")
+    def _validate_legacy_scope_pair(self) -> Self:
+        """Fail at startup when only one half of the legacy pin is set and no
+        `TIGER_SCOPE` outranks it, so a stale TIGER_STATE_FIPS without its
+        county list cannot send an import statewide. `scope_spec_from_settings`
+        applies the precedence the import job uses, so a half pin left in the
+        env beside a `TIGER_SCOPE` is inert here exactly as it is there."""
+        scope_spec_from_settings(self)
+        return self
+
     voter_zip5_filter: list[str] | None = Field(
         default=None,
         description=(
@@ -98,17 +140,52 @@ class Settings(BaseSettings):
         ),
     )
 
-    # OSM refinement layer. Pin a specific Geofabrik daily snapshot
-    # (YYMMDD in the filename) rather than `-latest`, so the cached PBF
-    # filename encodes the version and re-runs are reproducible.
-    osm_url: str = Field(
-        default="https://download.geofabrik.de/north-america/us/new-york-260501.osm.pbf",
-        description="URL of the Geofabrik OSM PBF extract to ingest (date-pinned).",
+    # OSM refinement layer. One PBF extract per state in scope, resolved by
+    # `osm.osm_extract_urls`: an explicit `OSM_URLS` list wins; otherwise each
+    # state takes the pinned URL for its Geofabrik slug in `OSM_URL_PINS`, else
+    # `OSM_URL_TEMPLATE`. A single `OSM_URL` acts as the pin for the
+    # state its filename names (`new-york-260501.osm.pbf` pins `new-york`), so
+    # other states in scope still resolve; a URL not named for a Geofabrik
+    # state (a BBBike city extract) is ingested verbatim as the only extract.
+    # Extracts are ingested once each (keyed by PBF filename), so a template
+    # URL ending in `-latest` is pinned by the copy in `osm_data_dir` — delete
+    # that file to refresh it, and every table reloads the extract; a
+    # date-stamped pin (YYMMDD in the filename) makes the snapshot explicit.
+    osm_url_template: str = Field(
+        default="https://download.geofabrik.de/north-america/us/{state}-latest.osm.pbf",
+        description="Per-state extract URL; `{state}` is the Geofabrik slug (new-york, new-jersey, …).",
+    )
+    osm_url_pins: dict[str, str] = Field(
+        default={"new-york": "https://download.geofabrik.de/north-america/us/new-york-260501.osm.pbf"},
+        description=(
+            "Geofabrik slug → exact extract URL, used instead of OSM_URL_TEMPLATE for that state (JSON object)."
+        ),
+    )
+    osm_urls: Annotated[list[str] | None, NoDecode] = Field(
+        default=None,
+        description="Comma-separated extract URLs to ingest verbatim, overriding per-state resolution.",
+    )
+    osm_url: str | None = Field(
+        default=None,
+        description=(
+            "A single extract URL. Named for a Geofabrik state (…/new-york-260501.osm.pbf) it pins that state and "
+            "other states in scope still resolve via OSM_URL_PINS / OSM_URL_TEMPLATE; any other URL is ingested "
+            "verbatim as the only extract."
+        ),
     )
     osm_data_dir: str = Field(
         default="./osm_cache",
-        description="Local directory to cache the downloaded OSM PBF.",
+        description="Local directory to cache the downloaded OSM PBFs.",
     )
+
+    @field_validator("osm_urls", mode="before")
+    @classmethod
+    def _split_osm_urls(cls, value: object) -> object:
+        """`OSM_URLS` arrives from the environment as one comma-separated string."""
+        if isinstance(value, str):
+            items = [u.strip() for u in value.split(",") if u.strip()]
+            return items or None
+        return value
 
     quickwit_batch_size: int = Field(
         default=1_000_000,

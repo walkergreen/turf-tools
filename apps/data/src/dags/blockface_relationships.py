@@ -35,6 +35,7 @@ from src.blockface_topology import (
     classify_node,
 )
 from src.dags.tiger import GEO_CATALOG, TIGER_SCHEMA
+from src.geo.projection import NORTHERN_UTM_EPSG_BASE, utm_zone_sql
 from src.models import TableRef
 
 # How far along the edge (meters) to sample when computing the departure
@@ -75,12 +76,23 @@ def blockface_relationships(
     tiger_edges_raw: TableRef,
     conn: duckdb.DuckDBPyConnection,
     relationship_zip_codes: list[str] | None = None,
+    # Not named `utm_epsg`: Hamilton binds parameters to graph nodes by name,
+    # and `geocode.utm_epsg` would pull the voter graph (`persons_best_match`)
+    # into this TIGER-only build whenever the two modules share a driver.
+    bearing_epsg: int | None = None,
 ) -> TableRef:
     """Build ``geo_ducklake.tiger.blockface_relationships``.
 
     One row per (blockface pair, meeting point). ``node_id`` is NULL for
     mid-block ``across`` rows; a pair can meet at more than one node, so
     consumers take the min-cost row per pair.
+
+    ``bearing_epsg`` is the metric projection for the departure-bearing
+    sample; ``None`` projects each node in the UTM zone of its own
+    longitude, so the shared catalog may span several zones (or both
+    coasts) and every node still gets an honest 10 m sample. The output is
+    insensitive to the zone — bearings are locally conformal and crossing
+    costs come from the MTFCC table — only the sample length is measured.
     """
     table = "blockface_relationships"
     fqn = _fqn(table)
@@ -141,44 +153,73 @@ def blockface_relationships(
     """)
 
     # -- 4. Departure bearings, vectorized in the metric projection -------
+    # One row per (node, incident edge end) in geographic coordinates, with
+    # the node's longitude and UTM zone. Every end at a node shares the
+    # node's longitude, so a node's radial order is always computed in one
+    # zone even when the catalog spans several.
+    conn.execute(f"""
+        CREATE OR REPLACE TEMP TABLE _bfrel_ends AS
+        WITH ends AS (
+            SELECT
+                from_node_id AS node_id, tiger_line_id, 'from' AS which_end, feature_class_code, geom,
+                ST_X(ST_StartPoint(geom)) AS node_lon
+            FROM _bfrel_edges
+            WHERE geom IS NOT NULL AND from_node_id IN (SELECT node_id FROM _bfrel_nodes)
+            UNION ALL
+            SELECT
+                to_node_id, tiger_line_id, 'to', feature_class_code, geom,
+                ST_X(ST_EndPoint(geom))
+            FROM _bfrel_edges
+            WHERE geom IS NOT NULL AND to_node_id IN (SELECT node_id FROM _bfrel_nodes)
+        )
+        SELECT *, {utm_zone_sql("node_lon")} AS zone FROM ends
+    """)
+    if bearing_epsg is None:
+        zones = [z for (z,) in conn.execute("SELECT DISTINCT zone FROM _bfrel_ends ORDER BY 1").fetchall()]
+        passes = [(NORTHERN_UTM_EPSG_BASE + z, f"zone = {z}") for z in zones]
+    else:
+        passes = [(bearing_epsg, "TRUE")]
+
     # A degenerate sample (zero-length edge, or sample == endpoint) can't
     # yield a bearing; those ends are dropped and the node classifies
     # from the remaining edges.
-    edge_end_rows = conn.execute(f"""
-        WITH prepared AS (
-            SELECT
-                tiger_line_id,
-                feature_class_code,
-                from_node_id,
-                to_node_id,
-                ST_Transform(geom, 'OGC:CRS84', 'EPSG:32618') AS geom_m
-            FROM _bfrel_edges
-        ),
-        measured AS (
-            SELECT *, ST_Length(geom_m) AS len_m FROM prepared
-        ),
-        ends AS (
-            SELECT
-                from_node_id AS node_id, tiger_line_id, 'from' AS which_end, feature_class_code,
-                ST_StartPoint(geom_m) AS origin,
-                ST_LineInterpolatePoint(geom_m, LEAST({_BEARING_SAMPLE_M} / len_m, 0.5)) AS sample
-            FROM measured
-            WHERE len_m > 0 AND from_node_id IN (SELECT node_id FROM _bfrel_nodes)
-            UNION ALL
-            SELECT
-                to_node_id, tiger_line_id, 'to', feature_class_code,
-                ST_EndPoint(geom_m),
-                ST_LineInterpolatePoint(geom_m, GREATEST(1.0 - {_BEARING_SAMPLE_M} / len_m, 0.5))
-            FROM measured
-            WHERE len_m > 0 AND to_node_id IN (SELECT node_id FROM _bfrel_nodes)
+    edge_end_rows: list[tuple] = []
+    for epsg, zone_filter in passes:
+        edge_end_rows.extend(
+            conn.execute(f"""
+                WITH prepared AS (
+                    SELECT
+                        node_id, tiger_line_id, which_end, feature_class_code,
+                        ST_Transform(geom, 'OGC:CRS84', 'EPSG:{epsg}') AS geom_m
+                    FROM _bfrel_ends
+                    WHERE {zone_filter}
+                ),
+                measured AS (
+                    SELECT *, ST_Length(geom_m) AS len_m FROM prepared
+                ),
+                ends AS (
+                    SELECT
+                        node_id, tiger_line_id, which_end, feature_class_code,
+                        CASE WHEN which_end = 'from' THEN ST_StartPoint(geom_m) ELSE ST_EndPoint(geom_m) END AS origin,
+                        ST_LineInterpolatePoint(
+                            geom_m,
+                            CASE WHEN which_end = 'from'
+                                 THEN LEAST({_BEARING_SAMPLE_M} / len_m, 0.5)
+                                 ELSE GREATEST(1.0 - {_BEARING_SAMPLE_M} / len_m, 0.5)
+                            END
+                        ) AS sample
+                    FROM measured
+                    WHERE len_m > 0
+                )
+                SELECT
+                    node_id, tiger_line_id, which_end, feature_class_code,
+                    degrees(atan2(ST_Y(sample) - ST_Y(origin), ST_X(sample) - ST_X(origin))) AS bearing_deg
+                FROM ends
+                WHERE ST_X(sample) != ST_X(origin) OR ST_Y(sample) != ST_Y(origin)
+            """).fetchall()
         )
-        SELECT
-            node_id, tiger_line_id, which_end, feature_class_code,
-            degrees(atan2(ST_Y(sample) - ST_Y(origin), ST_X(sample) - ST_X(origin))) AS bearing_deg
-        FROM ends
-        WHERE ST_X(sample) != ST_X(origin) OR ST_Y(sample) != ST_Y(origin)
-        ORDER BY node_id
-    """).fetchall()
+    # The streaming loop below relies on nodes arriving as contiguous groups.
+    edge_end_rows.sort(key=lambda r: r[0])
 
     # -- 5. Per-node classification in Python -----------------------------
     blockfaces_by_line_side: dict[tuple[str, str], Blockface] = {}

@@ -15,6 +15,10 @@ position_source:
 This file constructs synthetic upstream tables — `persons_best_match`,
 `persons_decomposed`, `blockface_final`, `osm_building_lookup`,
 `address_tokens` — and asserts each branch is exercised correctly.
+
+Also covers `utm_epsg` — the per-version UTM zone chosen from the matched
+blockfaces' median longitude — and that `refined_positions` measures its
+7 m road offset in that zone rather than a fixed one.
 """
 
 import pytest
@@ -29,6 +33,8 @@ from src.models import TableRef
 from src.tables import ensure_schema, table_fqn
 
 ORG = "geocode_test"
+# UTM 18N — the zone every NYC-shaped fixture below lands in.
+NYC_EPSG = 32618
 
 
 def _org_ref(table: str) -> TableRef:
@@ -265,12 +271,13 @@ class TestRefinedPositionsBranches:
     plausible region.
     """
 
-    def _run(self, conn, pd, pbm, bf, obl):
+    def _run(self, conn, pd, pbm, bf, obl, utm_epsg=NYC_EPSG):
         return geocode.refined_positions(
             persons_best_match=pbm,
             persons_decomposed=pd,
             blockface_final=bf,
             osm_building_lookup=obl,
+            utm_epsg=utm_epsg,
             schema=ORG,
             conn=conn,
         )
@@ -367,6 +374,7 @@ class TestRefinedPositionsRankPartition:
             persons_decomposed=pd,
             blockface_final=bf,
             osm_building_lookup=obl,
+            utm_epsg=NYC_EPSG,
             schema=ORG,
             conn=conn,
         )
@@ -401,6 +409,7 @@ class TestOsmOnlyMatches:
             osm_building_lookup=obl,
             blockface_final=bf,
             address_tokens=tokens,
+            utm_epsg=NYC_EPSG,
             schema=ORG,
             conn=conn,
         )
@@ -428,8 +437,103 @@ class TestOsmOnlyMatches:
             osm_building_lookup=obl,
             blockface_final=bf,
             address_tokens=tokens,
+            utm_epsg=NYC_EPSG,
             schema=ORG,
             conn=conn,
         )
         count = conn.execute(f"SELECT count(*) FROM {ref.fqn}").fetchone()[0]
         assert count == 0, "TIGER-matched voter shouldn't appear in osm_only"
+
+
+# ---------------------------------------------------------------------------
+# utm_epsg — the per-version metric projection
+# ---------------------------------------------------------------------------
+
+
+def _insert_bf_pair(conn, eid, blockface_id, geom):
+    """One matched voter + the blockface_final row it matched, sharing `geom`."""
+    _insert_decomposed(conn, eid, 100, "WEST 42 STREET")
+    _insert_best_match(conn, eid, blockface_id, "West 42 Street", 100, bf_geom=geom)
+    _insert_blockface(conn, blockface_id, "West 42 Street", geom=geom)
+
+
+def _shifted(geom_nyc: str, dlon: float) -> str:
+    """Translate a NYC WKT linestring east-west by `dlon` degrees."""
+    coords = geom_nyc[len("LINESTRING(") : -1].split(",")
+    moved = []
+    for c in coords:
+        lon, lat = c.split()
+        moved.append(f"{float(lon) + dlon} {lat}")
+    return "LINESTRING(" + ", ".join(moved) + ")"
+
+
+class TestUtmEpsg:
+    NYC_LINE = "LINESTRING(-74.01 40.75, -73.99 40.75)"
+
+    def test_nyc_matches_pick_zone_18(self, synth):
+        conn, pd, pbm, bf, _obl, _ = synth
+        _insert_bf_pair(conn, "v1", "T1:left", self.NYC_LINE)
+        _insert_bf_pair(conn, "v2", "T2:left", "LINESTRING(-73.95 40.80, -73.94 40.80)")
+        assert geocode.utm_epsg(pbm, bf, conn) == NYC_EPSG
+
+    def test_los_angeles_matches_pick_zone_11(self, synth):
+        conn, pd, pbm, bf, _obl, _ = synth
+        _insert_bf_pair(conn, "v1", "T1:left", _shifted(self.NYC_LINE, -118.24 - -74.0))
+        assert geocode.utm_epsg(pbm, bf, conn) == 32611
+
+    def test_median_not_mean_decides(self, synth):
+        """Twenty-five NYC blockfaces and one LA outlier: the median (and the
+        5th/95th percentiles the span check reads) stay in zone 18, where a
+        mean would be dragged two zones west."""
+        conn, pd, pbm, bf, _obl, _ = synth
+        for i in range(25):
+            _insert_bf_pair(conn, f"v{i}", f"T{i}:left", _shifted(self.NYC_LINE, 0.001 * i))
+        _insert_bf_pair(conn, "la", "LA:left", _shifted(self.NYC_LINE, -118.24 - -74.0))
+        assert geocode.utm_epsg(pbm, bf, conn) == NYC_EPSG
+
+    def test_no_matches_falls_back_to_the_blockfaces_in_scope(self, synth):
+        """`blockface_final` is rebuilt per version from `geo_scope`, so the
+        fallback median only ever sees this version's counties."""
+        conn, pd, pbm, bf, _obl, _ = synth
+        _insert_blockface(conn, "T1:left", "West 42 Street", geom=_shifted(self.NYC_LINE, -87.6 - -74.0))
+        assert geocode.utm_epsg(pbm, bf, conn) == 32616
+
+    def test_no_blockfaces_at_all_raises(self, synth):
+        conn, pd, pbm, bf, _obl, _ = synth
+        with pytest.raises(ValueError, match="no blockfaces"):
+            geocode.utm_epsg(pbm, bf, conn)
+
+
+class TestProjectionIsHonestOutsideZone18:
+    def test_road_offset_measures_seven_meters_in_the_dataset_zone(self, synth):
+        """An LA-shaped `osm_matched` voter lands `ROAD_OFFSET_M` from the
+        blockface when measured in UTM 11N. A fixed UTM 18N projection would
+        place the dot ~5.8 m out — the scale error two dozen zones away."""
+        conn, pd, pbm, bf, obl, _ = synth
+        line = "LINESTRING(-118.25 34.05, -118.23 34.05)"
+        _insert_decomposed(conn, "v1", 100, "WEST 42 STREET")
+        _insert_best_match(conn, "v1", "T1:left", "West 42 Street", 100, bf_geom=line)
+        _insert_blockface(conn, "T1:left", "West 42 Street", geom=line)
+        canonical_key = _canonical_key(conn, "West 42 Street")
+        _insert_osm_building(conn, canonical_key, "100", lat=34.0501, lon=-118.24, in_complex=False)
+        ref = geocode.refined_positions(
+            persons_best_match=pbm,
+            persons_decomposed=pd,
+            blockface_final=bf,
+            osm_building_lookup=obl,
+            utm_epsg=32611,
+            schema=ORG,
+            conn=conn,
+        )
+        source, dist_m = conn.execute(
+            f"""
+            SELECT position_source,
+                   ST_Distance(
+                       ST_Transform(ST_GeomFromText('{line}'), 'OGC:CRS84', 'EPSG:32611'),
+                       ST_Transform(ST_Point(longitude, latitude), 'OGC:CRS84', 'EPSG:32611')
+                   )
+            FROM {ref.fqn}
+            """
+        ).fetchone()
+        assert source == "osm_matched"
+        assert dist_m == pytest.approx(geocode.ROAD_OFFSET_M, abs=0.05)

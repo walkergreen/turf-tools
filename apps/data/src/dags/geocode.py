@@ -32,6 +32,7 @@ from src.addressing import (
     street_rewrite_sql,
     tokenize_street_sql,
 )
+from src.geo.projection import utm_epsg_for_longitudes
 from src.models import TableRef
 from src.tables import PERSON_CATALOG, ensure_schema, table_fqn
 
@@ -40,7 +41,8 @@ def _current_version(conn: duckdb.DuckDBPyConnection) -> int:
     return conn.sql(f"FROM {PERSON_CATALOG}.current_snapshot()").fetchone()[0]
 
 
-# Geometric constants for road-projected positioning (meters, UTM-18N).
+# Geometric constants for road-projected positioning (meters, in the
+# dataset's UTM zone — see `utm_epsg`).
 #
 # `MIN_BUILDING_SPACING_M` — minimum desired along-line distance between
 # distinct buildings on the same blockface side. The shove logic tries to
@@ -54,6 +56,54 @@ ROAD_OFFSET_M = 7.0
 
 
 # ---------------------------------------------------------------------------
+# Node 0 – the metric projection for this dataset version
+# ---------------------------------------------------------------------------
+
+
+def utm_epsg(
+    persons_best_match: TableRef,
+    blockface_final: TableRef,
+    conn: duckdb.DuckDBPyConnection,
+) -> int:
+    """EPSG code of the UTM zone every metric computation in this version uses.
+
+    Chosen from the median longitude of the blockfaces voters matched to
+    (`persons_best_match.blockface_id` joined to `blockface_final.geom`, so
+    no geometry scan of the voter table). A version with no TIGER matches
+    falls back to every blockface in scope — `blockface_final` is rebuilt per
+    version from `geo_scope`, so other states in the shared catalog do not
+    enter this median — because `osm_only_matches` still needs a zone.
+    `utm_epsg_for_longitudes` warns when the 5th/95th percentile longitudes
+    sit more than one zone from the central meridian and refuses a
+    continental span. Deterministic for fixed table contents.
+    """
+    pbm = persons_best_match.fqn
+    bf_ = blockface_final.fqn
+
+    def longitude_stats(where_matched: bool) -> tuple[int, float | None, float | None, float | None]:
+        join = f"JOIN (SELECT DISTINCT blockface_id FROM {pbm}) m USING (blockface_id)" if where_matched else ""
+        return conn.execute(f"""
+            WITH lons AS (
+                SELECT ST_X(ST_Centroid(b.geom)) AS lon
+                FROM {bf_} b {join}
+                WHERE b.geom IS NOT NULL
+            )
+            SELECT count(*), median(lon), quantile_cont(lon, 0.05), quantile_cont(lon, 0.95) FROM lons
+        """).fetchone()
+
+    label = "matched blockfaces"
+    n, lon_median, lon_p05, lon_p95 = longitude_stats(where_matched=True)
+    if n == 0:
+        label = "blockfaces in scope"
+        n, lon_median, lon_p05, lon_p95 = longitude_stats(where_matched=False)
+    if n == 0:
+        raise ValueError("cannot choose a UTM zone: no blockfaces with geometry")
+    epsg = utm_epsg_for_longitudes(lon_median, lon_p05, lon_p95, label=label)
+    print(f"UTM zone {epsg - 32600} (EPSG:{epsg}) from {n:,} {label}, median longitude {lon_median:.3f}")
+    return epsg
+
+
+# ---------------------------------------------------------------------------
 # Node 1 – per-voter refined position (TIGER + OSM)
 # ---------------------------------------------------------------------------
 
@@ -63,6 +113,7 @@ def refined_positions(
     persons_decomposed: TableRef,
     blockface_final: TableRef,
     osm_building_lookup: TableRef,
+    utm_epsg: int,
     schema: str,
     conn: duckdb.DuckDBPyConnection,
 ) -> TableRef:
@@ -195,9 +246,10 @@ def refined_positions(
 
     print("  computing fractions + final positions…")
     t0 = time.time()
-    # All math in UTM-18N. ST_LineLocatePoint in geographic degrees gives
-    # a non-perpendicular foot on non-cardinal streets — the rotated
-    # grid skews along-street by up to ~20% of the perpendicular offset.
+    # All math in the dataset's UTM zone (`utm_epsg`). ST_LineLocatePoint
+    # in geographic degrees gives a non-perpendicular foot on non-cardinal
+    # streets — the rotated grid skews along-street by up to ~20% of the
+    # perpendicular offset.
     conn.execute(f"""
         CREATE TABLE {fqn} AS
         -- Pre-compute the UTM-transformed geometry and OSM projection
@@ -209,10 +261,10 @@ def refined_positions(
                 external_id, blockface_id, bf_side, tiger_line_id,
                 house_num_prefix, person_house_number, half_code,
                 osm_lat, osm_lon, osm_street, osm_housenumber, in_complex,
-                ST_Transform(bf_geom, 'OGC:CRS84', 'EPSG:32618') AS bf_m,
+                ST_Transform(bf_geom, 'OGC:CRS84', 'EPSG:{utm_epsg}') AS bf_m,
                 CASE WHEN osm_lat IS NOT NULL
                      THEN ST_Transform(ST_Point(osm_lon, osm_lat),
-                                       'OGC:CRS84', 'EPSG:32618')
+                                       'OGC:CRS84', 'EPSG:{utm_epsg}')
                      ELSE NULL
                 END AS osm_pt_m
             FROM _voter_with_osm
@@ -337,7 +389,7 @@ def refined_positions(
                     )
                   ELSE pt_m
                   END,
-                  'EPSG:32618', 'OGC:CRS84'
+                  'EPSG:{utm_epsg}', 'OGC:CRS84'
                 ) AS pt_4326
             FROM offset_geom
         )
@@ -402,6 +454,7 @@ def osm_only_matches(
     osm_building_lookup: TableRef,
     blockface_final: TableRef,
     address_tokens: TableRef,
+    utm_epsg: int,
     schema: str,
     conn: duckdb.DuckDBPyConnection,
 ) -> TableRef:
@@ -417,8 +470,9 @@ def osm_only_matches(
     Schema: (external_id, latitude, longitude, osm_street,
              blockface_id, snap_distance_m).
 
-    The snap is informational — `snap_distance_m` reports how far the
-    voter is from their associated blockface. Large distances just mean
+    The snap is informational — `snap_distance_m` (meters, measured in
+    the dataset's UTM zone) reports how far the voter is from their
+    associated blockface. Large distances just mean
     the building isn't directly on a street (residential complexes
     where buildings sit set back from any road); the blockface_id is
     still useful for grouping.
@@ -512,9 +566,9 @@ def osm_only_matches(
             SELECT v.zip5, v.latitude, v.longitude,
                    b.blockface_id,
                    ST_Distance(
-                       ST_Transform(b.geom, 'OGC:CRS84', 'EPSG:32618'),
+                       ST_Transform(b.geom, 'OGC:CRS84', 'EPSG:{utm_epsg}'),
                        ST_Transform(ST_Point(v.longitude, v.latitude),
-                                    'OGC:CRS84', 'EPSG:32618')
+                                    'OGC:CRS84', 'EPSG:{utm_epsg}')
                    ) AS d_m
             FROM distinct_locs v
             JOIN {bf_} b ON b.zip_code = v.zip5
