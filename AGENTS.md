@@ -18,3 +18,12 @@ When making claims about how the codebase works ("we use X for Y", "we'd lose X 
 Tactical claims about code you're editing get verified naturally because you have to read the code to write the code. Architectural claims have no such built-in check, so it's easy to drift into confident-sounding wrongness based on stored memory or pattern-matching from similar codebases. Add the verification step explicitly.
 
 Treat saved architecture notes (memories, doc files, prior conversation) as starting points for investigation, not as facts to relay. The code is the truth.
+
+# Voter data
+
+Row-level voter data never enters the conversation, and that means tool results as much as the terminal. This repo builds canonical Person / Building / Door records; a `SELECT *` against any of them is a PII dump with no command to inspect and no redirect to hide behind.
+
+- Query for counts, distributions, and schema. `DESCRIBE` and `COUNT(*)` over `SELECT *`.
+- When row-level output is genuinely needed, write it to a file, report the row count, and stop. Do not read the file back.
+- No identity column in a projection, and no cells below k=5 — a count of 1 re-identifies.
+- Fixtures under `apps/data/fixtures/` hold real voter samples. Gitignored is not the same as safe to read; don't `cat` them.
