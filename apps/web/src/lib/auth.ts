@@ -7,6 +7,7 @@ import nodemailer, { type Transporter } from "nodemailer";
 import { and, db, eq, isNull } from "@turf-tools/db";
 import { accounts, memberships, sessions, users, verifications } from "@turf-tools/db/schema";
 import { normalizeEmail } from "./normalize-email";
+import { recordSendFailure } from "./send-outcome";
 
 // Resolved lazily so dev can boot without SMTP config; the login URL +
 // OTP code print to the server console in that case.
@@ -183,11 +184,12 @@ export const auth = betterAuth({
           console.log(`[auth] otp for ${to}: ${otp} (${verifyUrl})`);
           return;
         }
-        await transport.sendMail({
-          from,
-          to,
-          subject: "Log in to Turf Tools",
-          html: `<div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; color: #333;">
+        try {
+          await transport.sendMail({
+            from,
+            to,
+            subject: "Log in to Turf Tools",
+            html: `<div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; color: #333;">
   <br/>
   <h2 style="font-weight: 600;">Welcome to <i>Turf Tools</i></h2>
   <p style="font-size: 16px;">Click the button below to log in securely:</p>
@@ -202,7 +204,20 @@ export const auth = betterAuth({
 
   <p style="font-size: 16px; color: #888;">This link will expire in 1 hour.</p>
 </div>`,
-        });
+          });
+        } catch (err) {
+          // Better Auth swallows anything thrown here after logging it raw,
+          // so the failure is recorded for server-side senders instead. Only
+          // transport codes are logged — nodemailer's message and response
+          // name the recipient.
+          const e = err as { code?: string; responseCode?: number; command?: string };
+          console.error("[auth] sign-in email send failed", {
+            code: e?.code,
+            responseCode: e?.responseCode,
+            command: e?.command,
+          });
+          recordSendFailure(err);
+        }
       },
     }),
     // Writes cookies from programmatic auth.api.* calls (notably the sliding

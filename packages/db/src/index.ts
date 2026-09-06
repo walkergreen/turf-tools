@@ -9,6 +9,7 @@ import * as schema from "./schema";
 export { and, asc, desc, eq, gt, gte, inArray, isNull, ne, sql } from "drizzle-orm";
 
 export * from "./ids";
+export * from "./service-tokens";
 
 export type Db = PgAsyncDatabase<PgQueryResultHKT, typeof schema>;
 

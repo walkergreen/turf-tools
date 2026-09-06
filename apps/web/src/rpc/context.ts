@@ -105,3 +105,18 @@ export type NativeContext = { db: Db };
 export const nativeBase = os.$context<NativeContext>();
 export const nativePub = nativeBase.route({ method: "GET" });
 export const nativeMut = nativeBase.route({ method: "POST" });
+
+// --- Service tier: bearer-token automation, cross-org, acts as the token's actor user ---
+
+// Built by `authenticateServiceToken` (lib/service-auth.ts). Handlers name
+// the org per call (by slug) rather than carrying one in the context, and
+// attribute every write to `actor`.
+export type ServiceContext = {
+  db: Db;
+  actor: User;
+  token: { serviceTokenId: string; name: string };
+};
+
+export const serviceBase = os.$context<ServiceContext>();
+export const servicePub = serviceBase.route({ method: "GET" });
+export const serviceMut = serviceBase.route({ method: "POST" });

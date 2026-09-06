@@ -37,7 +37,7 @@ import { Input } from "~/components/input";
 import { Pill } from "~/components/pill";
 import { Switch } from "~/components/switch";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "~/components/table";
-import { formatDateTime } from "~/lib/format";
+import { formatDate, formatDateTime } from "~/lib/format";
 import { importerLabel } from "~/lib/importers";
 import { useRememberSelection } from "~/lib/last-selected";
 import { GRAY, GREEN, RED, YELLOW } from "~/lib/palette";
@@ -134,7 +134,15 @@ function DatasetPage() {
   return (
     <DatasetEditor
       key={datasetId}
-      dataset={{ datasetId, name: first.name, importer: first.importer, versions }}
+      dataset={{
+        datasetId,
+        name: first.name,
+        importer: first.importer,
+        approvalTicketId: first.approvalTicketId,
+        approvedAt: first.approvedAt,
+        contributionReportedAt: first.contributionReportedAt,
+        versions,
+      }}
       orgSlug={orgSlug}
       timezone={timezone}
     />
@@ -146,7 +154,15 @@ function DatasetEditor({
   orgSlug,
   timezone,
 }: {
-  dataset: { datasetId: string; name: string; importer: string; versions: VersionRow[] };
+  dataset: {
+    datasetId: string;
+    name: string;
+    importer: string;
+    approvalTicketId: string | null;
+    approvedAt: Date | null;
+    contributionReportedAt: Date | null;
+    versions: VersionRow[];
+  };
   orgSlug: string;
   timezone: string;
 }) {
@@ -274,6 +290,12 @@ function DatasetEditor({
           {readyVersionId ? "Update" : "Import"}
         </Button>
       </EditorHeader>
+      <ApprovalProvenance
+        ticketId={dataset.approvalTicketId}
+        approvedAt={dataset.approvedAt}
+        contributionReportedAt={dataset.contributionReportedAt}
+        timezone={timezone}
+      />
 
       <RenameDatasetDialog
         open={renameDataset.isOpen}
@@ -329,6 +351,32 @@ function DatasetEditor({
         />
       </div>
     </EditorPage>
+  );
+}
+
+// Where this org's access to the dataset came from, when it was granted by
+// the service API on a Compliance-approved request. Renders nothing for
+// grants made in-app.
+function ApprovalProvenance({
+  ticketId,
+  approvedAt,
+  contributionReportedAt,
+  timezone,
+}: {
+  ticketId: string | null;
+  approvedAt: Date | null;
+  contributionReportedAt: Date | null;
+  timezone: string;
+}) {
+  if (!ticketId) return null;
+  return (
+    <p className="-mt-2 mb-4 text-sm text-muted-foreground">
+      Approved by Compliance via Zendesk #{ticketId}
+      {approvedAt ? ` on ${formatDate(approvedAt, timezone)}` : ""}
+      {contributionReportedAt
+        ? ` · contribution reported ${formatDate(contributionReportedAt, timezone)}`
+        : ""}
+    </p>
   );
 }
 

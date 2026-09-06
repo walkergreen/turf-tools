@@ -2,9 +2,9 @@ import { ORPCError } from "@orpc/server";
 import { and, asc, eq, isNull, sql, type Db } from "@turf-tools/db";
 import { memberships, users } from "@turf-tools/db/schema";
 import { z } from "zod";
-import { auth } from "~/lib/auth";
 import { normalizeEmail } from "~/lib/normalize-email";
 import { ROLES } from "~/lib/permissions";
+import { sendSignInEmail } from "~/lib/sign-in-email";
 import { checkPermission, webMut, webPub } from "../context";
 
 const roleSchema = z.enum(ROLES);
@@ -103,10 +103,7 @@ export const invite = webMut
     });
 
     if (input.sendEmail) {
-      await auth.api.sendVerificationOTP({
-        body: { email: displayEmail, type: "sign-in" },
-        headers: new Headers(),
-      });
+      await sendSignInEmail(displayEmail);
     }
 
     return { ok: true as const, userId };
@@ -240,10 +237,7 @@ export const resendInvite = webMut
     )[0];
     if (!row) throw new ORPCError("NOT_FOUND");
 
-    await auth.api.sendVerificationOTP({
-      body: { email: row.displayEmail, type: "sign-in" },
-      headers: new Headers(),
-    });
+    await sendSignInEmail(row.displayEmail);
 
     return { ok: true as const };
   });

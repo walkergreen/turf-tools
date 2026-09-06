@@ -3,6 +3,10 @@ import { check, text, timestamp, uuid } from "drizzle-orm/pg-core";
 import { app } from "./app";
 import { datasetVersions } from "./datasets";
 
+// The slug rule, for validating in application code before a write reaches
+// the database. Must stay identical to the `slug_format` CHECK below.
+export const ORG_SLUG_PATTERN = /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/;
+
 export const organizations = app.table(
   "organizations",
   {

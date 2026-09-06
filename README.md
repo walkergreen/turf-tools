@@ -100,6 +100,46 @@ And run the type checks and linters with:
 pnpm check
 ```
 
+## Service API
+
+A token-authenticated API at `/api/service/*` lets DSA's Org Tools automation (zapctl, driven by the Zendesk VAN-request process) provision a chapter in Turf Tools once Compliance has approved its request: create the org, grant it a dataset, invite its admins, and create approved survey questions. It is server-to-server only and is never exposed in the admin UI.
+
+### Tokens
+
+Tokens are minted by an operator with database access and stored hashed (sha256) in `app.service_tokens`; the raw token is printed once. Each token acts as an "actor" user, so everything the API creates is attributed to a real `users` row (the actor has no org membership and cannot log in).
+
+```bash
+pnpm service-token:create --name zapctl-prod --actor-email automation@example.org
+pnpm service-token:revoke --list
+pnpm service-token:revoke --prefix tt_AbCdEfGhI    # or --name zapctl-prod
+```
+
+The `app.service_tokens` table and the provenance columns below reach a database through the usual `pnpm db:push`.
+
+### Calling it
+
+Send `Authorization: Bearer <token>` with a JSON body. A missing, unknown, or revoked token returns `401 {"error":"unauthorized"}`; handler errors are oRPC JSON (`code`, `status`, `message`), e.g. `404 NOT_FOUND` for an unknown org or dataset and `400 BAD_REQUEST` for invalid input.
+
+| Method + path                            | Body                                                                                                                        | Returns                                                                          |
+| ---------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------- |
+| `GET /api/service/healthcheck`           | –                                                                                                                           | `status`, `db`, `token.name`                                                     |
+| `POST /api/service/organizations/status` | `slug`                                                                                                                      | `found`, `provisioned` (has a grant), `organization`, `grants[]` with provenance |
+| `POST /api/service/organizations/ensure` | `slug`, `name`                                                                                                              | `created`, `organization`; idempotent, never renames                             |
+| `POST /api/service/datasets/list`        | `{}`                                                                                                                        | every dataset with `latestReadyVersionId`                                        |
+| `POST /api/service/datasets/grant`       | `orgSlug`, `datasetSlug`, `approvalTicketId`, `approvedAt?`, `contributionReportedAt?`, `note?`, `activate?` (default true) | `created`, `datasetOrganizationId`, `activated`                                  |
+| `POST /api/service/users/invite`         | `orgSlug`, `email`, `name?`, `role` (owner/admin/lead), `sendEmail?` (default true)                                         | `userId`, `membership` (created/reactivated/existing), `emailSent`               |
+| `POST /api/service/questions/create`     | `orgSlug`, `name`, `text`, `responseType?`, `options[]`                                                                     | `created`, `questionId`, `optionIds[]`; idempotent on name                       |
+
+`users/invite` writes the membership before it sends the sign-in email; if the send fails, the response is still `200` with `emailSent: false` (the failure is logged server-side), and repeating the call resends without changing the membership.
+
+`approvalTicketId` must be the Zendesk ticket number (digits only): it is shown verbatim to the chapter's admins and, once recorded, is never overwritten. `approvedAt` and `contributionReportedAt` are ISO timestamps; a JSON `null` for either reads as not supplied, while numbers, booleans, and unparseable strings are rejected. A grant records where the approval came from on `app.dataset_organizations` (`approval_ticket_id`, `approved_at`, `contribution_reported_at`, `approval_note`, `granted_by_user_id`); a repeat grant fills only columns that are still null, so the first recorded approval stands. The Data page shows this provenance under the dataset name. With `activate`, an org that has no active dataset version yet is pointed at the dataset's newest ready version.
+
+Every call logs one line, `{"event":"service.rpc","token":…,"procedure":…,"orgSlug":…}` — never emails or request bodies.
+
+### Cloudflare Access
+
+When the deployment sits behind Cloudflare Access, the caller also sends `CF-Access-Client-Id` / `CF-Access-Client-Secret` for an Access service token. Cloudflare validates those at the edge; Turf Tools passes them through untouched and authenticates only the bearer token.
+
 ## Database commands
 
 These subcommands help manage data lifecycle during testing:
