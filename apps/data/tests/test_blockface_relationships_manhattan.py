@@ -26,6 +26,7 @@ import pytest
 import duckdb
 from src.dags.blockface_relationships import blockface_relationships
 from src.dags.tiger import blockface_unpivoted, tiger_addrfeat_raw, tiger_edges_raw
+from src.geo.scope import CountyScope
 
 ZIP = "10003"
 
@@ -66,8 +67,9 @@ def manhattan(tiger_cache_dir):
         conn.execute(f"ATTACH 'ducklake:{tmpdir}/voter.ducklake' AS ducklake (DATA_PATH '{tmpdir}/voter_data/')")
         conn.execute("USE ducklake")
 
-        addrfeat = tiger_addrfeat_raw("2024", "36", ["061"], tiger_cache_dir, conn)
-        edges = tiger_edges_raw("2024", "36", ["061"], tiger_cache_dir, conn)
+        manhattan_scope = [CountyScope("36", "061")]
+        addrfeat = tiger_addrfeat_raw(manhattan_scope, "2024", tiger_cache_dir, conn)
+        edges = tiger_edges_raw(manhattan_scope, "2024", tiger_cache_dir, conn)
         unpivoted = blockface_unpivoted(addrfeat, edges, conn)
 
         started = time.time()

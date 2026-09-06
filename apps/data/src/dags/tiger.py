@@ -1,8 +1,10 @@
 """Prepare TIGER reference data for address matching.
 
-Downloads TIGER/Line shapefiles for the configured state/county
-selection and produces a normalized, query-ready blockface table.
-All output lives in the ``ducklake_geo`` catalog, shared across orgs.
+Downloads TIGER/Line shapefiles for every (state, county) pair in the
+dataset version's geographic scope (`geo_scope`, resolved by
+`src/geo/tiger_scope.resolve_tiger_scope`) and produces a normalized,
+query-ready blockface table. All output lives in the ``ducklake_geo``
+catalog, shared across orgs.
 
     tiger_addrfeat_raw ─┐
                         ├─► blockface_unpivoted ─► blockface_normalized ─► blockface_final
@@ -11,18 +13,16 @@ All output lives in the ``ducklake_geo`` catalog, shared across orgs.
 """
 
 import json
-import time
-import urllib.request
 from pathlib import Path
-from zipfile import ZipFile
 
 import duckdb
 from src.addressing import EQUIVALENT_TOKEN_GROUPS, tokenize_street_sql
+from src.geo import tiger_files
+from src.geo.scope import CountyScope, group_by_state, scope_sql
 from src.models import TableRef
 
 GEO_CATALOG = "ducklake_geo"
 TIGER_SCHEMA = "tiger"
-CENSUS_BASE_URL = "https://www2.census.gov/geo/tiger"
 
 
 def _fqn(table: str) -> str:
@@ -42,28 +42,14 @@ def _current_version(conn: duckdb.DuckDBPyConnection) -> int:
     return conn.sql(f"FROM {GEO_CATALOG}.current_snapshot()").fetchone()[0]
 
 
-def _download_and_extract(url: str, zip_path: Path, extract_dir: Path) -> None:
-    """Download a zip from *url* to *zip_path* and extract into *extract_dir*.
-
-    No-ops if the zip already exists on disk (i.e. a prior successful download).
-    """
-    extract_dir.mkdir(parents=True, exist_ok=True)
-    if not zip_path.exists():
-        # Census's Cloudflare edge rejects the default Python-urllib UA
-        # and caches the HTML rejection at the edge URL-keyed; the unique
-        # query param bypasses that cache. Census ignores unknown params.
-        fetch_url = f"{url}?_={int(time.time() * 1000)}"
-        req = urllib.request.Request(fetch_url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req) as resp, open(zip_path, "wb") as f:  # noqa: S310
-            f.write(resp.read())
-
-    with ZipFile(zip_path) as zf:
-        zf.extractall(extract_dir)
-
-
-def _shp_files(directory: Path, pattern: str) -> list[Path]:
-    """Return all .shp files in *directory* matching *pattern*."""
-    return sorted(directory.glob(pattern))
+def _pending(conn: duckdb.DuckDBPyConnection, fqn: str, geo_scope: list[CountyScope]) -> list[CountyScope]:
+    """The pairs in `geo_scope` with no rows yet in `fqn`, sorted. One scan of
+    the distinct (state, county) pairs already loaded, however wide the scope."""
+    loaded = {
+        CountyScope(state, county)
+        for state, county in conn.execute(f"SELECT DISTINCT state_fips, county_fips FROM {fqn}").fetchall()
+    }
+    return sorted(set(geo_scope) - loaded)
 
 
 # ---------------------------------------------------------------------------
@@ -72,9 +58,8 @@ def _shp_files(directory: Path, pattern: str) -> list[Path]:
 
 
 def tiger_addrfeat_raw(
+    geo_scope: list[CountyScope],
     tiger_year: str,
-    tiger_state_fips: str,
-    tiger_county_fips: list[str],
     tiger_data_dir: str,
     conn: duckdb.DuckDBPyConnection,
 ) -> TableRef:
@@ -84,9 +69,8 @@ def tiger_addrfeat_raw(
     both sides of each street segment plus ZIP codes — the essential inputs for
     geocoding via linear interpolation.
 
-    Incremental: rows are only inserted when the (tiger_line_id, state_fips,
-    county_fips) triple is not already present, so re-running for a superset of
-    counties is safe.
+    Incremental per (state_fips, county_fips): pairs already present are
+    skipped, so re-running for a superset scope is safe.
     """
     table = "addrfeat"
     fqn = _fqn(table)
@@ -110,23 +94,14 @@ def tiger_addrfeat_raw(
         )
     """)
 
-    for county in tiger_county_fips:
-        # Skip if this county is already loaded.
-        existing = conn.execute(
-            f"SELECT count(*) FROM {fqn} WHERE state_fips = ? AND county_fips = ?",
-            [tiger_state_fips, county],
-        ).fetchone()[0]
-        if existing > 0:
-            continue
+    for pair in _pending(conn, fqn, geo_scope):
+        url = tiger_files.tiger_zip_url("ADDRFEAT", tiger_year, pair.state_fips, pair.county_fips)
+        zip_path = data_dir / url.rsplit("/", 1)[-1]
+        extract_dir = data_dir / f"{pair.state_fips}{pair.county_fips}"
 
-        filename = f"tl_{tiger_year}_{tiger_state_fips}{county}_addrfeat.zip"
-        url = f"{CENSUS_BASE_URL}/TIGER{tiger_year}/ADDRFEAT/{filename}"
-        zip_path = data_dir / filename
-        extract_dir = data_dir / f"{tiger_state_fips}{county}"
+        tiger_files.download_and_extract(url, zip_path, extract_dir)
 
-        _download_and_extract(url, zip_path, extract_dir)
-
-        for shp in _shp_files(extract_dir, "*.shp"):
+        for shp in tiger_files.shp_files(extract_dir):
             conn.execute(f"""
                 INSERT INTO {fqn}
                 SELECT
@@ -139,8 +114,8 @@ def tiger_addrfeat_raw(
                     ZIPL                                    AS left_zip_code,
                     ZIPR                                    AS right_zip_code,
                     {tokenize_street_sql("FULLNAME")}                AS street_name_tokens,
-                    '{tiger_state_fips}'                   AS state_fips,
-                    '{county}'                             AS county_fips,
+                    '{pair.state_fips}'                    AS state_fips,
+                    '{pair.county_fips}'                   AS county_fips,
                     geom
                 FROM ST_Read('{shp}')
             """)
@@ -155,9 +130,8 @@ def tiger_addrfeat_raw(
 
 
 def tiger_edges_raw(
+    geo_scope: list[CountyScope],
     tiger_year: str,
-    tiger_state_fips: str,
-    tiger_county_fips: list[str],
     tiger_data_dir: str,
     conn: duckdb.DuckDBPyConnection,
 ) -> TableRef:
@@ -167,7 +141,7 @@ def tiger_edges_raw(
     needed to stitch blockface segments together into a network, as well as the
     line geometry used for coordinate interpolation.
 
-    Incremental: skips counties already loaded.
+    Incremental per (state_fips, county_fips): pairs already present are skipped.
     """
     table = "edges"
     fqn = _fqn(table)
@@ -188,22 +162,14 @@ def tiger_edges_raw(
         )
     """)
 
-    for county in tiger_county_fips:
-        existing = conn.execute(
-            f"SELECT count(*) FROM {fqn} WHERE state_fips = ? AND county_fips = ?",
-            [tiger_state_fips, county],
-        ).fetchone()[0]
-        if existing > 0:
-            continue
+    for pair in _pending(conn, fqn, geo_scope):
+        url = tiger_files.tiger_zip_url("EDGES", tiger_year, pair.state_fips, pair.county_fips)
+        zip_path = data_dir / url.rsplit("/", 1)[-1]
+        extract_dir = data_dir / f"{pair.state_fips}{pair.county_fips}"
 
-        filename = f"tl_{tiger_year}_{tiger_state_fips}{county}_edges.zip"
-        url = f"{CENSUS_BASE_URL}/TIGER{tiger_year}/EDGES/{filename}"
-        zip_path = data_dir / filename
-        extract_dir = data_dir / f"{tiger_state_fips}{county}"
+        tiger_files.download_and_extract(url, zip_path, extract_dir)
 
-        _download_and_extract(url, zip_path, extract_dir)
-
-        for shp in _shp_files(extract_dir, "*.shp"):
+        for shp in tiger_files.shp_files(extract_dir):
             conn.execute(f"""
                 INSERT INTO {fqn}
                 SELECT
@@ -213,8 +179,8 @@ def tiger_edges_raw(
                     TNIDF                                   AS from_node_id,
                     TNIDT                                   AS to_node_id,
                     {tokenize_street_sql("FULLNAME")}                AS street_name_tokens,
-                    '{tiger_state_fips}'                   AS state_fips,
-                    '{county}'                             AS county_fips,
+                    '{pair.state_fips}'                    AS state_fips,
+                    '{pair.county_fips}'                   AS county_fips,
                     geom
                 FROM ST_Read('{shp}')
             """)
@@ -229,9 +195,8 @@ def tiger_edges_raw(
 
 
 def tiger_tabblock_raw(
+    geo_scope: list[CountyScope],
     tiger_year: str,
-    tiger_state_fips: str,
-    tiger_county_fips: list[str],
     tiger_data_dir: str,
     conn: duckdb.DuckDBPyConnection,
 ) -> TableRef:
@@ -244,10 +209,10 @@ def tiger_tabblock_raw(
     boundary shapefiles.
 
     Unlike addrfeat/edges, tabblock is published per-state, not
-    per-county. We download the state's full file once and filter rows
-    to the configured counties on insert.
+    per-county. Each state in scope with pending counties is downloaded
+    once and filtered to those counties on insert.
 
-    Incremental: skips counties already loaded.
+    Incremental per (state_fips, county_fips): pairs already present are skipped.
     """
     table = "tabblock"
     fqn = _fqn(table)
@@ -276,40 +241,30 @@ def tiger_tabblock_raw(
         )
     """)
 
-    counties_to_load = []
-    for county in tiger_county_fips:
-        existing = conn.execute(
-            f"SELECT count(*) FROM {fqn} WHERE state_fips = ? AND county_fips = ?",
-            [tiger_state_fips, county],
-        ).fetchone()[0]
-        if existing == 0:
-            counties_to_load.append(county)
-
-    if not counties_to_load:
+    pending_by_state = group_by_state(_pending(conn, fqn, geo_scope))
+    if not pending_by_state:
         version = _current_version(conn)
         return TableRef(catalog=GEO_CATALOG, schema=TIGER_SCHEMA, table=table, version=version)
 
-    filename = f"tl_{tiger_year}_{tiger_state_fips}_tabblock20.zip"
-    url = f"{CENSUS_BASE_URL}/TIGER{tiger_year}/TABBLOCK20/{filename}"
-    zip_path = data_dir / filename
-    extract_dir = data_dir / tiger_state_fips
+    for state, counties in pending_by_state.items():
+        url = tiger_files.tiger_zip_url("TABBLOCK20", tiger_year, state)
+        zip_path = data_dir / url.rsplit("/", 1)[-1]
+        extract_dir = data_dir / state
 
-    _download_and_extract(url, zip_path, extract_dir)
+        tiger_files.download_and_extract(url, zip_path, extract_dir)
 
-    counties_sql_list = ", ".join(f"'{c}'" for c in counties_to_load)
-    for shp in _shp_files(extract_dir, "*.shp"):
-        conn.execute(f"""
-            INSERT INTO {fqn}
-            SELECT
-                GEOID20                           AS block_geoid,
-                STATEFP20                         AS state_fips,
-                COUNTYFP20                        AS county_fips,
-                ALAND20                           AS land_area,
-                geom
-            FROM ST_Read('{shp}')
-            WHERE STATEFP20 = '{tiger_state_fips}'
-              AND COUNTYFP20 IN ({counties_sql_list})
-        """)
+        for shp in tiger_files.shp_files(extract_dir):
+            conn.execute(f"""
+                INSERT INTO {fqn}
+                SELECT
+                    GEOID20                           AS block_geoid,
+                    STATEFP20                         AS state_fips,
+                    COUNTYFP20                        AS county_fips,
+                    ALAND20                           AS land_area,
+                    geom
+                FROM ST_Read('{shp}')
+                WHERE {tiger_files.tabblock_filter_sql(state, counties)}
+            """)
 
     version = _current_version(conn)
     return TableRef(catalog=GEO_CATALOG, schema=TIGER_SCHEMA, table=table, version=version)
@@ -586,12 +541,17 @@ def blockface_normalized(
 
 def blockface_final(
     blockface_normalized: TableRef,
+    tiger_addrfeat_raw: TableRef,
     address_tokens: TableRef,
+    geo_scope: list[CountyScope],
     conn: duckdb.DuckDBPyConnection,
 ) -> TableRef:
-    """Query-ready blockface table.
+    """Query-ready blockface table for this version's ``geo_scope``.
 
-    Three transforms on top of ``blockface_normalized``:
+    Three transforms on top of the ``blockface_normalized`` rows whose
+    TIGER line belongs to a county in ``geo_scope`` (``tiger_addrfeat_raw``
+    carries each line's state and county; a county-border line appears in
+    both counties' files and is in scope through either):
 
     1. **Alias collapse.** TIGER addrfeat sometimes stores the same
        physical blockface under multiple street names (e.g. a street
@@ -599,7 +559,7 @@ def blockface_final(
        ``side``, prefix, and address range, different ``full_name``.
        ``GROUP BY (tlid, side, prefix, from, to)`` merges these into
        one row. The canonical ``full_name`` is the one that appears
-       most often across the dataset (alphabetical tiebreak).
+       most often across this version's scope (alphabetical tiebreak).
 
        Note: this does *not* collapse rows that share a TIGER line but
        legitimately represent distinct address ranges — those have
@@ -620,11 +580,16 @@ def blockface_final(
        ``address_tokens`` lookup so abbreviations match full forms
        (st↔street, ave↔avenue, 1st↔first, …).
 
-    Non-incremental: the collapse needs to see all rows at once.
+    Non-incremental: rebuilt per import from the in-scope rows, since the
+    collapse and the frequency ranking need to see them all at once. The
+    raw, unpivoted, and normalized tables stay the shared additive cache;
+    scoping here is what keeps another state's counties in that cache from
+    shifting this version's canonical names or table size.
     """
     table = "blockface_final"
     fqn = _fqn(table)
     norm_fqn = blockface_normalized.fqn
+    addrfeat_fqn = tiger_addrfeat_raw.fqn
     tokens_fqn = address_tokens.fqn
 
     _ensure_schema(conn)
@@ -632,9 +597,16 @@ def blockface_final(
 
     conn.execute(f"""
         CREATE TABLE {fqn} AS
-        WITH name_freq AS (
+        WITH in_scope AS (
+            SELECT n.*
+            FROM {norm_fqn} n
+            WHERE n.tiger_line_id IN (
+                SELECT tiger_line_id FROM {addrfeat_fqn} WHERE {scope_sql(geo_scope)}
+            )
+        ),
+        name_freq AS (
             SELECT full_name, count(*) AS freq
-            FROM {norm_fqn}
+            FROM in_scope
             WHERE full_name IS NOT NULL
             GROUP BY full_name
         ),
@@ -656,7 +628,7 @@ def blockface_final(
                     ORDER BY COALESCE(f.freq, 0) DESC,
                              n.full_name ASC NULLS LAST
                 )                                                       AS canonical_rank
-            FROM {norm_fqn} n
+            FROM in_scope n
             LEFT JOIN name_freq f USING (full_name)
         ),
         -- Collapse alias rows by (tlid, side, prefix, from, to). Each

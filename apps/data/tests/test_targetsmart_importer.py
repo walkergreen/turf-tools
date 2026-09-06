@@ -15,11 +15,12 @@ from typing import TYPE_CHECKING
 import pytest
 
 import duckdb
-from src.importers.base import Manifest, SourceUnreadableError
+from src.importers.base import Manifest, SourceUnreadableError, validate_persons_table
 from src.importers.targetsmart import TargetSmartImporter
 from src.importers.targetsmart.manifest import TARGETSMART_MANIFEST
 from src.importers.targetsmart.transform import general_election_date_sql, iso_date_sql
 from src.models import Person
+from src.tables import table_fqn
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -365,6 +366,90 @@ def test_districts_and_codes_are_varchar_passthroughs(persons) -> None:
     assert row["county_code"] == "061"
     assert row["gender"] == "F"
     assert persons["TS-0002"]["congressional_district"] == "7"
+
+
+def test_county_fips_derives_from_a_numeric_county_code(persons) -> None:
+    assert persons["TS-0001"]["county_fips"] == "061"
+    assert persons["TS-0001"]["county_code"] == "061"
+    assert persons["TS-0002"]["county_fips"] is None
+
+
+def _minimal(voterbase_id: str, **values: object) -> dict[str, object]:
+    """A registered row carrying just the Person-required fields plus `values`."""
+    return _registered(
+        vb_voterbase_id=voterbase_id,
+        vb_tsmart_first_name="Min",
+        vb_tsmart_last_name="Imal",
+        vb_vf_reg_address_1="1 Main St",
+        vb_vf_reg_city="Albany",
+        vb_vf_reg_zip="12207",
+        **values,
+    )
+
+
+@pytest.mark.parametrize(
+    ("code", "county_fips"),
+    [("61", "061"), ("5", "005"), ("061", "061"), ("NEW YORK", None), ("", None), (None, None), ("1234", None)],
+)
+def test_county_fips_is_lpadded_or_null(conn, tmp_path, code, county_fips) -> None:
+    rows = [_minimal("TS-C", vb_vf_county_code=code)]
+    persons, _ = _load(conn, _write_parquet(tmp_path / "county.parquet", rows))
+    row = persons["TS-C"]
+    assert row["county_fips"] == county_fips
+    assert row["county_code"] == (code or None)
+    Person.model_validate(row)
+
+
+def test_tsmart_county_code_fills_in_when_present(conn, tmp_path) -> None:
+    rows = [
+        {**_minimal("TS-A"), "vb_tsmart_county_code": "5"},
+        {**_minimal("TS-B", vb_vf_county_code="47"), "vb_tsmart_county_code": "5"},
+    ]
+    persons, _ = _load(
+        conn, _write_parquet(tmp_path / "tsmart.parquet", rows, types={"vb_tsmart_county_code": "VARCHAR"})
+    )
+    assert persons["TS-A"]["county_fips"] == "005"
+    assert persons["TS-B"]["county_fips"] == "047"  # vb_vf_county_code wins
+
+
+# ---------------------------------------------------------------------------
+# validate_persons_table — the county_fips contract
+# ---------------------------------------------------------------------------
+
+
+def _validated_fqn(conn, tmp_path) -> str:
+    """Run the importer and return the `persons_validated` table it wrote, to
+    mutate `county_fips` in place and re-validate."""
+    return TargetSmartImporter().load(_write_parquet(tmp_path / "extract.parquet", ROWS), SCHEMA, conn, _Progress()).fqn
+
+
+@pytest.mark.parametrize("value", ["36061", "6"])
+def test_validate_rejects_a_malformed_county_fips(conn, tmp_path, value) -> None:
+    """A 5-digit GEOID or an unpadded code is not the contract; the error
+    names the offending value."""
+    fqn = _validated_fqn(conn, tmp_path)
+    conn.execute(f"UPDATE {fqn} SET county_fips = ?", [value])
+    with pytest.raises(ValueError, match="3-digit county FIPS") as excinfo:
+        validate_persons_table(fqn, conn)
+    assert value in str(excinfo.value)
+
+
+def test_validate_rejects_a_non_varchar_county_fips_column(conn, tmp_path) -> None:
+    """An INTEGER column cannot carry zero-padding, so it is rejected up
+    front rather than surfacing as a DuckDB binder error on the regexp."""
+    fqn = _validated_fqn(conn, tmp_path)
+    typed = table_fqn(SCHEMA, "persons_integer_county")
+    conn.execute(
+        f"CREATE TABLE {typed} AS SELECT * REPLACE (TRY_CAST(county_fips AS INTEGER) AS county_fips) FROM {fqn}"
+    )
+    with pytest.raises(ValueError, match="must be VARCHAR.*got INTEGER"):
+        validate_persons_table(typed, conn)
+
+
+def test_validate_accepts_an_all_null_county_fips_column(conn, tmp_path) -> None:
+    fqn = _validated_fqn(conn, tmp_path)
+    conn.execute(f"UPDATE {fqn} SET county_fips = NULL")
+    validate_persons_table(fqn, conn)
 
 
 def test_commercial_model_flag_passes_through(persons) -> None:

@@ -21,6 +21,8 @@ from src import postgres
 from src.dags import aggregate, assembly, boundaries, geocode, matching, osm, quickwit, tiger
 from src.derived import compute_derived_metadata
 from src.duckdb import OPERATIONAL_PG_ALIAS, attach_operational_postgres, get_connection
+from src.geo.scope import format_scope, scope_metadata, scope_spec_from_settings
+from src.geo.tiger_scope import county_match_rate_warnings, resolve_tiger_scope, scope_source
 from src.import_progress import ImportProgress, JobLog, ProgressNodeHook
 from src.importers.registry import get_importer
 from src.job_runner import IN_PROGRESS, INTERRUPTED_REASON, UNSTARTED, JobContext, job
@@ -29,6 +31,8 @@ from src.settings import get_settings
 from src.tables import dataset_version_schema, drop_schema, ensure_schema, finalize_version
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     import duckdb
     from src.settings import Settings
 
@@ -93,13 +97,16 @@ async def import_dataset_version(payload: ImportDatasetVersionPayload, ctx: JobC
 
 
 # Geocode-pipeline outputs, plus `tiger_tabblock_raw` — the census blocks the
-# boundary step unions over (not otherwise built during import).
+# boundary step unions over (not otherwise built during import) — and the
+# reference-data facts recorded in the version's derived metadata.
 _FINAL_VARS = [
     "persons_geocoded",
     "geocoding_summary",
     "buildings_geocoded",
     "doors_geocoded",
     "tiger_tabblock_raw",
+    "utm_epsg",
+    "osm_pbfs",
 ]
 
 
@@ -128,18 +135,21 @@ def _run(payload: ImportDatasetVersionPayload, job_id: str) -> dict[str, Any]:
             if fd.key_group is not None and fd.column is not None
         ]
 
-        # Config inputs the DAG receives (provided, not computed nodes).
+        # Config inputs the DAG receives (provided, not computed nodes). The
+        # geographic scope is an input too, resolved from the imported data
+        # after the importer runs, so it is named here only for progress sizing.
         dag_inputs = {
             "schema": schema,
             "tiger_year": settings.tiger_year,
-            "tiger_state_fips": settings.tiger_state_fips,
-            "tiger_county_fips": settings.tiger_county_fips,
             "tiger_data_dir": settings.tiger_data_dir,
+            "osm_url_template": settings.osm_url_template,
+            "osm_url_pins": settings.osm_url_pins,
+            "osm_urls": settings.osm_urls,
             "osm_url": settings.osm_url,
             "osm_data_dir": settings.osm_data_dir,
             "conn": conn,
         }
-        input_keys = set(dag_inputs) | {"persons_validated"}
+        input_keys = set(dag_inputs) | {"persons_validated", "geo_scope"}
 
         # Size progress from the importer's stages + the DAG's computed nodes +
         # one boundary union per key group; the hook reports one step per node.
@@ -161,8 +171,49 @@ def _run(payload: ImportDatasetVersionPayload, job_id: str) -> dict[str, Any]:
         persons_validated = importer.load(payload.source, schema, conn, progress)
         decoded = conn.execute(f"SELECT count(*) FROM {persons_validated.fqn}").fetchone()
         log.write(f"Decoded {decoded[0]:,} people from source" if decoded else "Source decoded")
-        result = dr.execute(final_vars=_FINAL_VARS, inputs={"persons_validated": persons_validated, **dag_inputs})
+
+        # Which TIGER counties (and so which states' OSM extracts) this version
+        # needs: pinned by settings, or read from the data just loaded. A
+        # statewide entry fetches the national county file first — outside the
+        # progress hook, so the log line covers the pause. Everything the
+        # resolver has to say about the scope (a state widened, persons outside
+        # a pin, a stray state) lands in the job log and is kept as `notes` on
+        # the version's geoScope metadata.
+        scope_spec, configured_source = scope_spec_from_settings(settings)
+        log.write("Resolving geographic scope…")
+        scope_notes: list[str] = []
+
+        def warn(message: str) -> None:
+            print(message, flush=True)
+            log.write(message, level="warning")
+            scope_notes.append(message)
+
+        geo_scope = resolve_tiger_scope(
+            conn,
+            persons_validated,
+            spec=scope_spec,
+            tiger_year=settings.tiger_year,
+            tiger_data_dir=settings.tiger_data_dir,
+            warn=warn,
+            log=log.write,
+        )
+        log.write(f"TIGER scope: {format_scope(geo_scope)}")
+        osm_warning = osm.osm_url_scope_warning(geo_scope, settings.osm_url, settings.osm_urls)
+        if osm_warning:
+            warn(osm_warning)
+        result = dr.execute(
+            final_vars=_FINAL_VARS,
+            inputs={"persons_validated": persons_validated, "geo_scope": geo_scope, **dag_inputs},
+        )
         log.write("Geocoding pipeline complete")
+        # The extract ids with their PBF sizes: two `-latest` snapshots share an
+        # id, and the size is what tells them apart in the log.
+        log.write("OSM extracts: " + ", ".join(_describe_pbf(p) for p in result["osm_pbfs"]))
+        # A county whose voters almost never matched a TIGER blockface means the
+        # scope loaded the wrong county for it (a non-FIPS county code), which
+        # nothing upstream can detect.
+        for message in county_match_rate_warnings(conn, result["persons_geocoded"].fqn):
+            warn(message)
 
         # Build each key group's polygons before finalize, so a `ready` version
         # is always zonable and the map's boundary fetch never 404s. Override the
@@ -176,8 +227,7 @@ def _run(payload: ImportDatasetVersionPayload, job_id: str) -> dict[str, Any]:
                     "conn": conn,
                     "key_group": source["key_group"],
                     "key_expression": source["key_expression"],
-                    "tiger_state_fips": settings.tiger_state_fips,
-                    "tiger_county_fips": settings.tiger_county_fips,
+                    "geo_scope": geo_scope,
                 },
                 overrides={
                     "persons_geocoded": result["persons_geocoded"],
@@ -219,7 +269,19 @@ def _run(payload: ImportDatasetVersionPayload, job_id: str) -> dict[str, Any]:
         progress.advance()
 
         geocoded_fqn = result["persons_geocoded"].fqn
-        derived = compute_derived_metadata(conn, geocoded_fqn, manifest)
+        derived = compute_derived_metadata(
+            conn,
+            geocoded_fqn,
+            manifest,
+            geo_scope=scope_metadata(
+                geo_scope,
+                source=scope_source(scope_spec, configured_source),
+                tiger_year=settings.tiger_year,
+                osm_extracts=[osm.extract_id(p) for p in result["osm_pbfs"]],
+                utm_epsg=result["utm_epsg"],
+                notes=scope_notes,
+            ),
+        )
         progress.advance()
         finalize_version(
             conn,
@@ -232,6 +294,15 @@ def _run(payload: ImportDatasetVersionPayload, job_id: str) -> dict[str, Any]:
         return {"row_count": derived["rowCount"], "schema": schema}
     finally:
         conn.close()
+
+
+def _describe_pbf(pbf: Path) -> str:
+    """``new-jersey-latest (312.4 MB)`` — the extract id with its on-disk size."""
+    try:
+        size_mb = pbf.stat().st_size / (1024 * 1024)
+    except OSError:
+        return osm.extract_id(pbf)
+    return f"{osm.extract_id(pbf)} ({size_mb:.1f} MB)"
 
 
 def _resolve_version(

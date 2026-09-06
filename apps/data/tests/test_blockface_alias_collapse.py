@@ -3,7 +3,7 @@
 `blockface_final` collapses TIGER addrfeat rows that share
 `(tiger_line_id, side, house_num_prefix, from_house_num, to_house_num)`
 into one row. The canonical `full_name` is the alias that appears most
-often across the dataset (alphabetical tiebreak).
+often across the version's `geo_scope` (alphabetical tiebreak).
 
 It emits two token columns:
   - `street_tokens_match`  — union of every alias row's tokens
@@ -15,8 +15,9 @@ It emits two token columns:
                               OSM canonical_key lookup so voters at the
                               same building converge on the same OSM record.
 
-These tests build a small synthetic blockface_normalized table by hand
-and run `tiger.blockface_final` against it.
+These tests build a small synthetic blockface_normalized table by hand,
+with a minimal `tiger.addrfeat` carrying each TIGER line's state and county
+(the scope filter reads it), and run `tiger.blockface_final` against them.
 """
 
 import pytest
@@ -24,6 +25,9 @@ import pytest
 import duckdb
 from src.addressing import tokenize_street_sql
 from src.dags import tiger
+from src.geo.scope import CountyScope
+
+MANHATTAN = [CountyScope("36", "061")]
 
 # Schema mirrors `tiger.blockface_normalized`. We write rows by hand and let
 # `tiger.blockface_final` consume them.
@@ -45,6 +49,17 @@ CREATE TABLE ducklake_geo.tiger.blockface_normalized (
 )
 """
 
+# The columns of `tiger.addrfeat` that `blockface_final` reads: which
+# (state, county) file each TIGER line came from.
+_ADDRFEAT_DDL = """
+CREATE TABLE ducklake_geo.tiger.addrfeat (
+    tiger_line_id       VARCHAR,
+    full_name           VARCHAR,
+    state_fips          VARCHAR,
+    county_fips         VARCHAR
+)
+"""
+
 
 def _insert_row(
     conn: duckdb.DuckDBPyConnection,
@@ -55,8 +70,11 @@ def _insert_row(
     hn_to: int,
     full_name: str,
     zip_code: str = "10001",
+    state_fips: str = "36",
+    county_fips: str = "061",
 ) -> None:
-    """Insert one synthetic blockface_normalized row."""
+    """Insert one synthetic blockface_normalized row and the addrfeat row it
+    derives from (`state_fips` / `county_fips` place the line in a county)."""
     bf_id = f"{tlid}:{side}"
     number_type = (
         "odd"
@@ -76,29 +94,41 @@ def _insert_row(
         """,
         [bf_id, side, hn_from, hn_to, prefix, number_type, zip_code, full_name, tlid, tokens, "n1", "n2"],
     )
+    conn.execute(
+        "INSERT INTO ducklake_geo.tiger.addrfeat VALUES (?, ?, ?, ?)",
+        [tlid, full_name, state_fips, county_fips],
+    )
 
 
 @pytest.fixture()
 def bf_conn(dual_conn):
-    """dual_conn with the tiger schema and an empty blockface_normalized table.
+    """dual_conn with the tiger schema and empty blockface_normalized +
+    addrfeat tables.
 
-    blockface_final reads from tiger.blockface_normalized; we hand-build it
-    rather than running tiger.tiger_addrfeat_raw / blockface_unpivoted /
-    blockface_normalized so the test stays focused on alias collapse and
-    isn't subject to TIGER's actual data shape.
+    blockface_final reads from tiger.blockface_normalized (scoped through
+    tiger.addrfeat); we hand-build both rather than running
+    tiger.tiger_addrfeat_raw / blockface_unpivoted / blockface_normalized so
+    the test stays focused on alias collapse and isn't subject to TIGER's
+    actual data shape.
     """
     dual_conn.execute("CREATE SCHEMA IF NOT EXISTS ducklake_geo.tiger")
     dual_conn.execute(_BF_NORM_DDL)
+    dual_conn.execute(_ADDRFEAT_DDL)
     # Seed the equivalency-groups table so blockface_final can JOIN on it.
     tiger.address_tokens(conn=dual_conn)
     return dual_conn
 
 
-def _run_blockface_final(conn):
+def _run_blockface_final(conn, geo_scope=MANHATTAN):
     norm_ref = type(
         "Ref",
         (),
         {"fqn": "ducklake_geo.tiger.blockface_normalized"},
+    )()
+    addrfeat_ref = type(
+        "Ref",
+        (),
+        {"fqn": "ducklake_geo.tiger.addrfeat"},
     )()
     tokens_ref = type(
         "Ref",
@@ -107,7 +137,9 @@ def _run_blockface_final(conn):
     )()
     return tiger.blockface_final(
         blockface_normalized=norm_ref,
+        tiger_addrfeat_raw=addrfeat_ref,
         address_tokens=tokens_ref,
+        geo_scope=geo_scope,
         conn=conn,
     )
 
@@ -195,3 +227,70 @@ class TestAliasCollapse:
             # Alias-only tokens must NOT appear in the lookup column.
             for alias_only in ("adam", "clayton", "powell"):
                 assert alias_only not in toks, f"lookup tokens leaked alias token {alias_only!r}: {toks}"
+
+
+class TestScope:
+    """`blockface_final` is rebuilt per import from the rows whose TIGER line
+    belongs to a county in `geo_scope`; the shared normalized table may hold
+    other states' counties from earlier imports."""
+
+    def _nyc_pair(self, bf_conn):
+        # In scope: one Manhattan blockface under two names, "7 Av" the more
+        # frequent of the two across Manhattan (T2 uses it too).
+        _insert_row(bf_conn, tlid="T1", side="left", prefix="", hn_from=1, hn_to=99, full_name="7 Av")
+        _insert_row(
+            bf_conn, tlid="T1", side="left", prefix="", hn_from=1, hn_to=99, full_name="Adam Clayton Powell Jr Blvd"
+        )
+        _insert_row(bf_conn, tlid="T2", side="left", prefix="", hn_from=101, hn_to=199, full_name="7 Av")
+
+    def test_out_of_scope_lines_are_excluded(self, bf_conn):
+        self._nyc_pair(bf_conn)
+        _insert_row(
+            bf_conn, "J1", "left", "", 1, 99, "Washington St", zip_code="07030", state_fips="34", county_fips="017"
+        )
+        ref = _run_blockface_final(bf_conn)
+        tlids = {r[0] for r in bf_conn.execute(f"SELECT tiger_line_id FROM {ref.fqn}").fetchall()}
+        assert tlids == {"T1", "T2"}
+
+    def test_out_of_scope_aliases_do_not_shift_the_canonical_pick(self, bf_conn):
+        """Twenty New Jersey rows named "Adam Clayton Powell Jr Blvd" sit in
+        the shared table; the Manhattan group still picks "7 Av", whose
+        frequency is counted within the scope only."""
+        self._nyc_pair(bf_conn)
+        for i in range(20):
+            _insert_row(
+                bf_conn,
+                tlid=f"J{i}",
+                side="left",
+                prefix="",
+                hn_from=1,
+                hn_to=99,
+                full_name="Adam Clayton Powell Jr Blvd",
+                zip_code="07030",
+                state_fips="34",
+                county_fips="017",
+            )
+        ref = _run_blockface_final(bf_conn)
+        rows = bf_conn.execute(f"SELECT full_name, street_tokens_lookup FROM {ref.fqn} ORDER BY 1").fetchall()
+        assert [r[0] for r in rows] == ["7 Av", "7 Av"]
+        for _, toks in rows:
+            assert "adam" not in toks
+
+        # The same rows with New Jersey in scope as well: the alias outnumbers
+        # "7 Av" 21 to 2, so the Manhattan group's canonical name flips.
+        ref = _run_blockface_final(bf_conn, geo_scope=[*MANHATTAN, CountyScope("34", "017")])
+        names = bf_conn.execute(f"SELECT DISTINCT full_name FROM {ref.fqn} WHERE tiger_line_id = 'T1'").fetchall()
+        assert names == [("Adam Clayton Powell Jr Blvd",)]
+
+    def test_county_border_line_is_in_scope_through_either_county(self, bf_conn):
+        """A TIGER line on a county border appears in both counties' addrfeat
+        files; either county in scope keeps the line."""
+        _insert_row(bf_conn, "B1", "left", "", 1, 99, "Border Rd", state_fips="36", county_fips="061")
+        _insert_row(bf_conn, "B1", "left", "", 1, 99, "Border Rd", state_fips="36", county_fips="005")
+        ref = _run_blockface_final(bf_conn, geo_scope=[CountyScope("36", "005")])
+        assert bf_conn.execute(f"SELECT count(*) FROM {ref.fqn}").fetchone()[0] == 1
+
+    def test_empty_scope_yields_an_empty_table(self, bf_conn):
+        self._nyc_pair(bf_conn)
+        ref = _run_blockface_final(bf_conn, geo_scope=[])
+        assert bf_conn.execute(f"SELECT count(*) FROM {ref.fqn}").fetchone()[0] == 0

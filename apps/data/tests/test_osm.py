@@ -18,12 +18,19 @@ Behaviors locked in:
   (deterministic across runs).
 - `in_residential_complex = TRUE` when the chosen building's centroid
   falls inside a `landuse=residential` polygon.
+- Only rows tagged with this version's extracts (`osm_pbfs`) are read, from
+  both the addresses and the landuse table; the same `osm_id` seen in two of
+  those extracts resolves to one row, deterministically.
 """
+
+from pathlib import Path
 
 import pytest
 
 from src.dags import osm, tiger
 from src.models import TableRef
+
+NY = "new-york-260501"
 
 
 def _create_osm_addresses(conn) -> TableRef:
@@ -43,7 +50,8 @@ def _create_osm_addresses(conn) -> TableRef:
             state         VARCHAR,
             building      VARCHAR,
             lat           DOUBLE,
-            lon           DOUBLE
+            lon           DOUBLE,
+            extract       VARCHAR
         )
     """)
     return TableRef(catalog="ducklake_geo", schema="osm", table="addresses", version=0)
@@ -57,7 +65,8 @@ def _create_osm_landuse_residential(conn) -> TableRef:
         CREATE TABLE ducklake_geo.osm.landuse_residential (
             landuse_id  BIGINT,
             name        VARCHAR,
-            geom        GEOMETRY
+            geom        GEOMETRY,
+            extract     VARCHAR
         )
     """)
     return TableRef(catalog="ducklake_geo", schema="osm", table="landuse_residential", version=0)
@@ -77,10 +86,11 @@ def _insert_addr(
     city="NEW YORK",
     state="NY",
     building="yes",
+    extract="new-york-260501",
 ):
     conn.execute(
-        "INSERT INTO ducklake_geo.osm.addresses VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-        [osm_id, kind, housenumber, street, unit, zip_code, city, state, building, lat, lon],
+        "INSERT INTO ducklake_geo.osm.addresses VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        [osm_id, kind, housenumber, street, unit, zip_code, city, state, building, lat, lon, extract],
     )
 
 
@@ -92,8 +102,10 @@ def synth(dual_conn):
     return dual_conn, addr, res, tokens
 
 
-def _run(conn, addr, res, tokens):
+def _run(conn, addr, res, tokens, extracts=(NY,)):
+    """Build the lookup for a version whose PBFs are `extracts`."""
     return osm.osm_building_lookup(
+        osm_pbfs=[Path(f"/cache/{e}.osm.pbf") for e in extracts],
         osm_addresses=addr,
         osm_landuse_residential=res,
         address_tokens=tokens,
@@ -241,7 +253,8 @@ class TestResidentialComplex:
                 42, 'Test Complex',
                 ST_GeomFromText('POLYGON((-73.999 40.745, -73.989 40.745,
                                           -73.989 40.755, -73.999 40.755,
-                                          -73.999 40.745))')
+                                          -73.999 40.745))'),
+                'new-york-260501'
             )
         """)
         ref = _run(conn, addr, res, tokens)
@@ -257,9 +270,112 @@ class TestResidentialComplex:
                 42, 'Test Complex',
                 ST_GeomFromText('POLYGON((-73.999 40.745, -73.989 40.745,
                                           -73.989 40.755, -73.999 40.755,
-                                          -73.999 40.745))')
+                                          -73.999 40.745))'),
+                'new-york-260501'
             )
         """)
         ref = _run(conn, addr, res, tokens)
         flag = conn.execute(f"SELECT in_residential_complex FROM {ref.fqn}").fetchone()[0]
         assert flag is False
+
+
+# ---------------------------------------------------------------------------
+# Multiple extracts
+# ---------------------------------------------------------------------------
+
+
+NJ = "new-jersey-latest"
+
+
+# A residential polygon around the default `_insert_addr` position.
+COMPLEX_WKT = "POLYGON((-73.999 40.745, -73.989 40.745, -73.989 40.755, -73.999 40.755, -73.999 40.745))"
+
+
+def _insert_landuse(conn, landuse_id, extract, wkt=COMPLEX_WKT):
+    conn.execute(
+        "INSERT INTO ducklake_geo.osm.landuse_residential VALUES (?, 'Complex', ST_GeomFromText(?), ?)",
+        [landuse_id, wkt, extract],
+    )
+
+
+class TestExtractUnion:
+    def test_building_lookup_unions_the_versions_extracts(self, synth):
+        """Buildings from the two state extracts of one version both surface
+        in the lookup."""
+        conn, addr, res, tokens = synth
+        _insert_addr(conn, 1, "100", "Broadway", zip_code="10001", extract=NY)
+        _insert_addr(conn, 2, "5", "Washington St", zip_code="07030", lat=40.74, lon=-74.03, extract=NJ)
+        ref = _run(conn, addr, res, tokens, extracts=(NY, NJ))
+        zips = {r[0] for r in conn.execute(f"SELECT zip_code FROM {ref.fqn}").fetchall()}
+        assert zips == {"10001", "07030"}
+
+    def test_same_osm_id_in_two_extracts_resolves_to_one_row(self, synth):
+        """A border building present in both of the version's extracts (same
+        osm_id, same address) yields exactly one lookup row, and the tiebreak
+        is by extract name so the chosen coordinates never depend on load
+        order."""
+        conn, addr, res, tokens = synth
+        _insert_addr(conn, 7, "100", "Broadway", kind="way", lat=40.7502, lon=-73.9902, extract=NY)
+        _insert_addr(conn, 7, "100", "Broadway", kind="way", lat=40.7501, lon=-73.9901, extract=NJ)
+        ref = _run(conn, addr, res, tokens, extracts=(NY, NJ))
+        rows = conn.execute(f"SELECT osm_lat, osm_lon FROM {ref.fqn} WHERE zip_code='10001'").fetchall()
+        assert rows == [(40.7501, -73.9901)]  # 'new-jersey-latest' sorts before 'new-york-260501'
+
+    def test_way_over_node_still_wins_across_extracts(self, synth):
+        """The way-over-node rule applies across extracts too."""
+        conn, addr, res, tokens = synth
+        _insert_addr(conn, 1, "100", "Broadway", kind="node", lat=40.7500, lon=-73.9900, extract="a")
+        _insert_addr(conn, 2, "100", "Broadway", kind="way", lat=40.7501, lon=-73.9901, extract="b")
+        ref = _run(conn, addr, res, tokens, extracts=("a", "b"))
+        row = conn.execute(f"SELECT osm_lat, osm_lon FROM {ref.fqn} WHERE zip_code='10001'").fetchone()
+        assert row == (40.7501, -73.9901)
+
+
+class TestVersionExtractsOnly:
+    """Rows in the shared raw tables that belong to an extract outside
+    `osm_pbfs` — another state's, or a retired snapshot's — never feed this
+    version's lookup."""
+
+    def test_repinned_snapshot_replaces_the_old_one(self, synth):
+        """Both snapshots of New York stay in the raw table after a re-pin;
+        with only the newer one in `osm_pbfs`, its coordinates win even though
+        the older extract id sorts first."""
+        conn, addr, res, tokens = synth
+        _insert_addr(conn, 7, "100", "Broadway", kind="way", lat=40.7502, lon=-73.9902, extract="new-york-260501")
+        _insert_addr(conn, 7, "100", "Broadway", kind="way", lat=40.7509, lon=-73.9909, extract="new-york-260901")
+        ref = _run(conn, addr, res, tokens, extracts=("new-york-260901",))
+        rows = conn.execute(f"SELECT osm_lat, osm_lon FROM {ref.fqn} WHERE zip_code='10001'").fetchall()
+        assert rows == [(40.7509, -73.9909)]
+
+    def test_demolished_building_in_the_old_snapshot_is_not_matchable(self, synth):
+        conn, addr, res, tokens = synth
+        _insert_addr(conn, 1, "100", "Broadway", extract="new-york-260501")
+        _insert_addr(conn, 2, "200", "Broadway", extract="new-york-260901")
+        ref = _run(conn, addr, res, tokens, extracts=("new-york-260901",))
+        numbers = [r[0] for r in conn.execute(f"SELECT housenumber FROM {ref.fqn}").fetchall()]
+        assert numbers == ["200"]
+
+    def test_other_states_rows_are_absent(self, synth):
+        conn, addr, res, tokens = synth
+        _insert_addr(conn, 1, "100", "Broadway", zip_code="10001", extract=NY)
+        _insert_addr(conn, 2, "5", "Washington St", zip_code="07030", lat=40.74, lon=-74.03, extract=NJ)
+        ref = _run(conn, addr, res, tokens, extracts=(NY,))
+        zips = {r[0] for r in conn.execute(f"SELECT zip_code FROM {ref.fqn}").fetchall()}
+        assert zips == {"10001"}
+
+    def test_landuse_from_an_unlisted_extract_does_not_flag_a_complex(self, synth):
+        conn, addr, res, tokens = synth
+        _insert_addr(conn, 1, "100", "Broadway", lat=40.75, lon=-73.99, extract=NY)
+        _insert_landuse(conn, 42, extract=NJ)
+        ref = _run(conn, addr, res, tokens, extracts=(NY,))
+        assert conn.execute(f"SELECT in_residential_complex FROM {ref.fqn}").fetchone()[0] is False
+        # The same polygon tagged with a listed extract flags the building.
+        _insert_landuse(conn, 43, extract=NY)
+        ref = _run(conn, addr, res, tokens, extracts=(NY,))
+        assert conn.execute(f"SELECT in_residential_complex FROM {ref.fqn}").fetchone()[0] is True
+
+    def test_no_extracts_builds_an_empty_lookup(self, synth):
+        conn, addr, res, tokens = synth
+        _insert_addr(conn, 1, "100", "Broadway", extract=NY)
+        ref = _run(conn, addr, res, tokens, extracts=())
+        assert conn.execute(f"SELECT count(*) FROM {ref.fqn}").fetchone()[0] == 0

@@ -174,6 +174,13 @@ class Importer(Protocol):
     Convention: each importer is a package whose `importer.py` defines the
     concrete class, with supporting stages in sibling modules; the package
     `__init__` re-exports the class.
+
+    Beyond the `Person` core, `persons_validated` may carry an optional
+    `county_fips VARCHAR` column: the 3-digit Census county FIPS code within
+    the row's `state` (zero-padded, never a 5-digit GEOID), or NULL when
+    unknown. When every row of a state has one, the geographic scope (which
+    TIGER counties to load) narrows to those counties; otherwise the whole
+    state is in scope. See `src/geo/scope.py`.
     """
 
     name: str
@@ -211,3 +218,18 @@ def validate_persons_table(fqn: str, conn: duckdb.DuckDBPyConnection) -> None:
             Person.model_validate(dict(zip(columns, row, strict=True)))
         except Exception as e:
             raise ValueError(f"Row {i} failed Person validation: {e}") from e
+    if "county_fips" in columns:
+        col_type = str(rel.types[columns.index("county_fips")])
+        if col_type != "VARCHAR":
+            # An INTEGER column cannot carry the zero-padding the contract
+            # requires (001–099), so it is rejected outright rather than cast.
+            raise ValueError(
+                f"persons_validated.county_fips must be VARCHAR (3-digit county FIPS or NULL); got {col_type}"
+            )
+        malformed = conn.execute(
+            f"SELECT county_fips FROM {fqn} "
+            "WHERE county_fips IS NOT NULL AND NOT regexp_matches(county_fips, '^[0-9]{3}$') LIMIT 5"
+        ).fetchall()
+        if malformed:
+            values = [r[0] for r in malformed]
+            raise ValueError(f"persons_validated.county_fips must be a 3-digit county FIPS code or NULL; got {values}")

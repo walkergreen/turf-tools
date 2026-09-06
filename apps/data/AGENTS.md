@@ -23,6 +23,66 @@ backed by DuckDB with two DuckLake catalogs attached:
 Both catalogs share **one DuckDB connection** (`src/duckdb.get_connection`),
 so cross-catalog joins are free — no data copying.
 
+### Geographic scope
+
+Each dataset version has a **geographic scope**: the `(state_fips,
+county_fips)` pairs whose TIGER data it needs and whose states' OSM extracts
+it ingests. `src/geo/scope.py` (pure) and `src/geo/tiger_scope.py` (DuckDB
+reads + the TIGER national county file) resolve it once per import, after the
+importer runs and before the DAG:
+
+1. `TIGER_SCOPE` (`Settings.tiger_scope`) — `36:005,047,061,081,085;34:017`,
+   or `36:*` for statewide; states accept FIPS or postal codes.
+2. The legacy `TIGER_STATE_FIPS` + `TIGER_COUNTY_FIPS` pair, folded into the
+   same form (both required; statewide is `TIGER_SCOPE=36:*`, and `Settings`
+   rejects one half without the other at startup — unless `TIGER_SCOPE` is
+   set, which outranks the pair and leaves a stale half inert).
+3. Derived from the data: the distinct `state` values of `persons_validated`,
+   narrowed to the distinct `county_fips` values for a state when every row of
+   that state carries a valid 3-digit code, else every county of the state
+   from `ducklake_geo.tiger.county` (loaded once per `TIGER_YEAR` from
+   `tl_{year}_us_county.zip`). Every distinct `state` value counts — one stray
+   row provisions its whole state — so the per-state row counts are logged
+   before any download; values that are not US postal codes are skipped with
+   a warning (only a table with no known state at all is an error). Derived
+   county codes are checked against the county table; a code that is not a
+   county of its state widens the state instead of loading a wrong county.
+
+Explicit county codes in a spec (steps 1 and 2) go through the same county
+table, and a code that is not a county of its state raises at scope
+resolution rather than as a Census 404 mid-DAG. A pin is deployment-wide: it
+applies to every dataset imported on that deployment, so remove it (or extend
+`TIGER_SCOPE`) before importing a second state. A pinned scope still reads
+`persons_validated.state`, and persons in a state the pin does not cover are
+reported as a warning (those rows will not geocode). Every such reason —
+rows lacking `county_fips`, no `county_fips` column, a widened state, a
+skipped state value, persons outside a pin — goes through the resolver's
+`warn` callable (`log` carries the per-state row counts); `import_job` routes
+both to `app.job_messages` and keeps the warnings as `geoScope.notes`.
+
+Importers feed step 3 through two optional-by-contract columns on
+`persons_validated`: `state` (2-letter postal; part of the `Person` core) and
+`county_fips` (3-digit county FIPS within that state, or NULL — see the
+`Importer` docstring in `src/importers/base.py`). The NYS importer maps BOE
+county codes through `importers/nys_voter_file/counties.py`; TargetSmart
+zero-pads a 1–3 digit numeric `vb_vf_county_code`.
+
+The DAG receives the result as the `geo_scope` input (`list[CountyScope]`);
+`tiger_*_raw`, `blockface_final`, `boundary_from_blocks`, and
+`osm_extract_urls` all read it. `import_job` and `seed-persons` log the
+resolved scope and record it (with the OSM extracts, UTM zone, and the
+warnings as `notes`) under `derived_metadata.geoScope`. After geocoding,
+`tiger_scope.county_match_rate_warnings` flags any county with at least 100
+persons where under 5 % matched a TIGER blockface — the signature of a county
+code that is not a Census FIPS code (the wrong county's blockfaces were
+loaded) — into the same log and notes.
+
+The metric projection is per version too: `geocode.utm_epsg` picks the UTM
+zone of the median matched-blockface longitude (`src/geo/projection.py`), and
+every `ST_Transform` to meters in `geocode` uses it. `blockface_relationships`
+projects each node in the UTM zone of its own longitude unless given a
+`bearing_epsg` (named so Hamilton never binds it to `geocode.utm_epsg`).
+
 ### Hamilton node return values: `TableRef`
 
 Hamilton nodes don't return DataFrames or relations. They execute their work
@@ -115,10 +175,17 @@ tiger_edges_raw  ───┘
 address_tokens ──────────────────────────────────────────► blockface_final
 ```
 
-Downloads TIGER/Line shapefiles per state/county/year, joins them into one
-blockface table. Each TIGER edge has both a left and right side with
-independent house-number ranges; `blockface_unpivoted` splits each edge
-into two rows (one per side).
+Downloads TIGER/Line shapefiles for every `(state, county)` pair in
+`geo_scope` (per `tiger_year`), joins them into one blockface table. The
+raw loaders are incremental per pair — a pair already in the table is not
+fetched again — and `tiger_tabblock_raw` downloads each state's TABBLOCK20
+file once, filtered to that state's counties in scope. URL construction and
+the download step live in `src/geo/tiger_files.py`; a download streams into
+a `.part` file renamed into place only when complete, so an interrupted
+transfer never poisons the cache, and a cached file that is not a zip is
+deleted and reported with its path. Each TIGER edge has both a left and
+right side with independent house-number ranges; `blockface_unpivoted`
+splits each edge into two rows (one per side).
 
 `blockface_final` carries:
 
@@ -138,27 +205,63 @@ into two rows (one per side).
 blockface under multiple names (a street and its commemorative co-name,
 abbreviation variants of the same name, …), those rows share
 `(tlid, side, prefix, from, to)`. `blockface_final` collapses them into
-one row, picking the canonical `full_name` by global frequency across
-the dataset (alphabetical tiebreak).
+one row, picking the canonical `full_name` by frequency across this
+version's `geo_scope` (alphabetical tiebreak).
 
 Equivalency expansion uses `EQUIVALENT_TOKEN_GROUPS` from
-`src/addressing.py`. Non-incremental: the collapse needs all rows.
+`src/addressing.py`. Non-incremental: `blockface_final` is rebuilt per
+import from the `blockface_normalized` rows whose TIGER line belongs to a
+county in `geo_scope` (`tiger_addrfeat_raw` carries each line's state and
+county), while the raw / unpivoted / normalized tables stay the shared,
+additive cache — so another state's counties in that cache never shift this
+version's canonical names, `utm_epsg` fallback, or table size.
 
 ### osm
 
 ```
-osm_pbf → osm_buildings_polygons    (osmium-derived building polygons + area centroids)
-        → osm_addresses              (raw OSM addressed elements)
-        → osm_landuse_residential    (assembled landuse polygons)
+geo_scope → osm_extract_urls → osm_pbfs → osm_buildings_polygons  (osmium-derived building polygons + area centroids)
+                                        → osm_addresses            (raw OSM addressed elements)
+                                        → osm_landuse_residential  (assembled landuse polygons)
 
 osm_addresses + osm_landuse_residential + address_tokens
     → osm_building_lookup            (per-building keyed for fast join)
 ```
 
 Symmetric to `tiger`: extracts OSM reference data into
-`ducklake_geo.osm`. The downstream `geocode` module consumes
-`osm_building_lookup` along with `blockface_final` for coordinate
-assignment.
+`ducklake_geo.osm`. `osm_extract_urls` resolves one PBF per state in scope
+(`OSM_URLS` verbatim > the state's slug in `OSM_URL_PINS` >
+`OSM_URL_TEMPLATE`; slugs in `src/geo/states.py`). A single `OSM_URL` named
+for a Geofabrik state (`src/geo/geofabrik.slug_for_url`) acts as the pin for
+that state, so other states in scope still resolve; a URL not named for any
+state (a BBBike city extract) is ingested verbatim as the only extract, with
+a warning (`osm_url_scope_warning`, also written to the job log) when the
+scope spans more than one state. `osm_pbfs` downloads through a `.part`
+file renamed into place on completion, and a freshly downloaded extract
+first drops its rows from the three raw tables and its osmium caches
+(`_invalidate_extract`; an extract downloaded for the first time has nothing
+to drop and is logged as a first download) — a re-downloaded `-latest` file
+is a new snapshot under the same extract id, so deleting the cached PBF is
+how to refresh one.
+The three raw tables carry an `extract` column (the PBF filename stem,
+`src/geo/geofabrik.extract_id`) and load incrementally per extract, each
+in one INSERT, so an interrupted extract is retried and a new state appends.
+The way→polygon join in `osm_addresses` is constrained to the same extract
+because Geofabrik state extracts overlap at borders. The downstream
+`geocode` module consumes `osm_building_lookup` — built from this version's
+extracts only (`osm_pbfs`), so another state's or a retired snapshot's rows
+in the shared tables never feed it — along with `blockface_final` for
+coordinate assignment.
+
+Rows for an extract no version uses any more stay in the raw tables as
+storage only. To retire one by hand:
+
+```sql
+DELETE FROM ducklake_geo.osm.buildings_polygons   WHERE extract = '<id>';
+DELETE FROM ducklake_geo.osm.addresses            WHERE extract = '<id>';
+DELETE FROM ducklake_geo.osm.landuse_residential  WHERE extract = '<id>';
+```
+
+`reset_ducklake --include-geo` drops the whole reference catalog instead.
 
 `osm_building_lookup` is one row per OSM-known building, keyed on
 `(zip_code, canonical_key, housenumber_norm)`, carrying:
@@ -173,8 +276,9 @@ assignment.
 
 When multiple OSM records share the same `(zip_code, canonical_key,
 housenumber_norm)` (rare; same address tagged on multiple polygons),
-the chosen record is the way (over a node) with the smallest `osm_id`
-— deterministic across runs.
+the chosen record is the way (over a node) with the smallest `osm_id`,
+then the first `extract` name for the same way seen in two of this
+version's overlapping extracts — deterministic across runs.
 
 ### matching
 
@@ -212,13 +316,21 @@ per voter; coordinate assignment is downstream in `geocode`.
 ### geocode
 
 ```
-persons_best_match + persons_decomposed + blockface_final + osm_building_lookup
+persons_best_match + blockface_final
+    → utm_epsg                       (the version's UTM zone, from the median matched longitude)
+
+persons_best_match + persons_decomposed + blockface_final + osm_building_lookup + utm_epsg
     → refined_positions              (TIGER-matched voter lat/lon)
 
 persons_decomposed + persons_best_match + osm_building_lookup
-                                       + blockface_final + address_tokens
+                       + blockface_final + address_tokens + utm_epsg
     → osm_only_matches               (TIGER-miss voter lat/lon + snapped blockface)
 ```
+
+All metric work (the 7 m road offset, 4 m building spacing, snap
+distances) runs in `utm_epsg`; scale error one zone from the central
+meridian is ~0.3 %, and `utm_epsg_for_longitudes` refuses a dataset whose
+5th–95th percentile longitudes span more than 20° from it.
 
 The actual coordinate-assignment step. Two paths, mutually exclusive
 (each voter appears in exactly one):
@@ -295,8 +407,9 @@ tracts, etc.) into `ducklake_geo.boundaries.{key_group}`. Three loaders
 write to the same shape:
 
 - `boundary_from_blocks` (preferred) — union the TIGER census blocks where
-  voters with each key live. No external shapefile needed; polygons match
-  the voter file by construction.
+  voters with each key live, reading only blocks inside the version's
+  `geo_scope`. No external shapefile needed; polygons match the voter file
+  by construction.
 - `boundary_from_geojson` — external GeoJSON (NYC Open Data, custom exports).
 - `boundary_from_table` — already in DuckLake (TIGER ZCTAs, tracts, etc.).
 
@@ -468,3 +581,12 @@ Writes one PNG per module (`voter_file_loader_graph.png`, `tiger_graph.png`,
 `assembly_graph.png`, `aggregate_graph.png`, `boundaries_graph.png`,
 `quickwit_graph.png`) plus a combined `pipeline_graph.png` into `docs/`.
 Graphviz must be installed (`brew install graphviz`).
+
+## Voter data in queries
+
+See the root `AGENTS.md` for the general rule. Specific to this package:
+
+- `ducklake` holds per-organization Person data. Any `SELECT *` against `persons_validated`, the Person / Building / Door tables, or an address-matched intermediate returns row-level PII straight to the terminal.
+- Inspect the DAG with schema reads and aggregates: `DESCRIBE`, `COUNT(*)`, `GROUP BY` on non-identity columns, null-rate checks. That answers almost every pipeline question.
+- When a node's output must be eyeballed row by row, write it to Parquet or CSV and open it outside the session rather than printing it.
+- `ducklake_geo` (TIGER blockfaces, OSM buildings, landuse, boundaries) carries no person data and is fine to query freely. The catalog is the line.

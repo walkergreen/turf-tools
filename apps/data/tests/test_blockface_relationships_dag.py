@@ -18,29 +18,74 @@ MAIN ST is in zip 10001, CROSS ST in zip 10002 — the zip-scoping test
 cuts along that line.
 """
 
+import statistics
+
 import pytest
 
 from src.dags.blockface_relationships import blockface_relationships
+from src.geo.projection import utm_epsg_for_longitudes
 from src.models import TableRef
 
-CENTER = (-73.99, 40.73)
+CENTER = (-73.99, 40.73)  # UTM zone 18
+# Los Angeles longitude at the same latitude: UTM zone 11, 44° west of CENTER.
+WEST_COAST = (-118.24, CENTER[1])
 STEP = 0.001  # ~85-110m; comfortably longer than the bearing sample
 
-LINES = {
-    # line_id: (wkt from -> to, from_node, to_node, zip, mtfcc)
-    "E": (f"LINESTRING({CENTER[0]} {CENTER[1]}, {CENTER[0] + STEP} {CENTER[1]})", "NC", "NE_END", "10001"),
-    "N": (f"LINESTRING({CENTER[0]} {CENTER[1]}, {CENTER[0]} {CENTER[1] + STEP})", "NC", "NN_END", "10002"),
-    # Digitized toward the center: NC is this line's TO end.
-    "W": (f"LINESTRING({CENTER[0] - STEP} {CENTER[1]}, {CENTER[0]} {CENTER[1]})", "NW_END", "NC", "10001"),
-    "S": (f"LINESTRING({CENTER[0]} {CENTER[1]}, {CENTER[0]} {CENTER[1] - STEP})", "NC", "NS_END", "10002"),
-}
+
+def _lines(center, prefix=""):
+    """The plus-sign's four lines around `center`:
+    line_id: (wkt from -> to, from_node, to_node, zip). `prefix` goes on
+    every line and node id so two plus-signs can share one table."""
+    lon, lat = center
+    p = prefix
+    return {
+        f"{p}E": (f"LINESTRING({lon} {lat}, {lon + STEP} {lat})", f"{p}NC", f"{p}NE_END", "10001"),
+        f"{p}N": (f"LINESTRING({lon} {lat}, {lon} {lat + STEP})", f"{p}NC", f"{p}NN_END", "10002"),
+        # Digitized toward the center: NC is this line's TO end.
+        f"{p}W": (f"LINESTRING({lon - STEP} {lat}, {lon} {lat})", f"{p}NW_END", f"{p}NC", "10001"),
+        f"{p}S": (f"LINESTRING({lon} {lat}, {lon} {lat - STEP})", f"{p}NC", f"{p}NS_END", "10002"),
+    }
+
+
+LINES = _lines(CENTER)
 
 
 @pytest.fixture()
 def geo_tables(dual_conn):
     """Production-shaped blockface_unpivoted + edges with the plus-sign."""
-    conn = dual_conn
+    return _build_geo_tables(dual_conn, CENTER)
+
+
+def _build_geo_tables(conn, center, prefix="", create=True):
+    """Insert the plus-sign around `center` (ids prefixed with `prefix`);
+    `create` builds the two tables first, otherwise the rows append."""
     conn.execute("CREATE SCHEMA IF NOT EXISTS ducklake_geo.tiger")
+    if create:
+        _create_geo_tables(conn)
+    for line_id, (wkt, from_node, to_node, zip_code) in _lines(center, prefix).items():
+        name = "MAIN ST" if line_id.removeprefix(prefix) in ("E", "W") else "CROSS ST"
+        conn.execute(
+            """
+            INSERT INTO ducklake_geo.tiger.edges VALUES
+            (?, ?, 'S1400', ?, ?, [], '36', '061', ST_GeomFromText(?))
+            """,
+            [line_id, name, from_node, to_node, wkt],
+        )
+        for side in ("left", "right"):
+            conn.execute(
+                """
+                INSERT INTO ducklake_geo.tiger.blockface_unpivoted VALUES
+                (?, ?, '1', '99', ?, ?, ?, [], ?, ?, ST_GeomFromText(?))
+                """,
+                [f"{line_id}:{side}", side, zip_code, name, line_id, from_node, to_node, wkt],
+            )
+    return {
+        "unpivoted": TableRef(catalog="ducklake_geo", schema="tiger", table="blockface_unpivoted", version=0),
+        "edges": TableRef(catalog="ducklake_geo", schema="tiger", table="edges", version=0),
+    }
+
+
+def _create_geo_tables(conn):
     conn.execute("""
         CREATE TABLE ducklake_geo.tiger.blockface_unpivoted (
             blockface_id        VARCHAR,
@@ -69,27 +114,6 @@ def geo_tables(dual_conn):
             geom                GEOMETRY
         )
     """)
-    for line_id, (wkt, from_node, to_node, zip_code) in LINES.items():
-        name = "MAIN ST" if line_id in ("E", "W") else "CROSS ST"
-        conn.execute(
-            """
-            INSERT INTO ducklake_geo.tiger.edges VALUES
-            (?, ?, 'S1400', ?, ?, [], '36', '061', ST_GeomFromText(?))
-            """,
-            [line_id, name, from_node, to_node, wkt],
-        )
-        for side in ("left", "right"):
-            conn.execute(
-                """
-                INSERT INTO ducklake_geo.tiger.blockface_unpivoted VALUES
-                (?, ?, '1', '99', ?, ?, ?, [], ?, ?, ST_GeomFromText(?))
-                """,
-                [f"{line_id}:{side}", side, zip_code, name, line_id, from_node, to_node, wkt],
-            )
-    return {
-        "unpivoted": TableRef(catalog="ducklake_geo", schema="tiger", table="blockface_unpivoted", version=0),
-        "edges": TableRef(catalog="ducklake_geo", schema="tiger", table="edges", version=0),
-    }
 
 
 def _run(conn, geo_tables, zips=None):
@@ -173,3 +197,74 @@ class TestZipScoping:
         assert north[2] == "continue"
         assert north[4] == ["N"]
         assert north[7] > 0.0
+
+
+class TestProjectionZone:
+    """The classification does not depend on the UTM zone: bearings are
+    locally conformal and crossing costs come from the MTFCC table."""
+
+    @staticmethod
+    def _signature(rows):
+        # Pair, kind, node, how many lines are crossed, penalty, cost. The
+        # symmetric plus-sign has two equally short kitty-corner routes, so
+        # *which* lines are crossed is a tie the geometry may break either way.
+        return sorted((r[0], r[1], r[2], r[3], len(r[4]), len(r[5]), r[6], r[7]) for r in rows)
+
+    def test_derived_zone_matches_explicit_18n(self, dual_conn, geo_tables):
+        derived = blockface_relationships(geo_tables["unpivoted"], geo_tables["edges"], dual_conn)
+        derived_rows = dual_conn.execute(f"SELECT * FROM {derived.fqn}").fetchall()
+        explicit = blockface_relationships(geo_tables["unpivoted"], geo_tables["edges"], dual_conn, bearing_epsg=32618)
+        explicit_rows = dual_conn.execute(f"SELECT * FROM {explicit.fqn}").fetchall()
+        assert self._signature(derived_rows) == self._signature(explicit_rows)
+        assert len(derived_rows) == 32
+
+    def test_plus_sign_in_zone_16_classifies_identically(self, dual_conn):
+        """The same plus-sign shifted west into UTM zone 16 (Illinois longitude,
+        same latitude) yields the same relationship set under EPSG:32616."""
+        nyc = _build_geo_tables(dual_conn, CENTER)
+        nyc_rows = _run(dual_conn, nyc)
+        dual_conn.execute("DROP TABLE ducklake_geo.tiger.blockface_unpivoted")
+        dual_conn.execute("DROP TABLE ducklake_geo.tiger.edges")
+        west = _build_geo_tables(dual_conn, (-87.6, CENTER[1]))
+        ref = blockface_relationships(west["unpivoted"], west["edges"], dual_conn, None, 32616)
+        west_rows = dual_conn.execute(f"""
+            SELECT blockface_id_a, blockface_id_b, kind, node_id,
+                   crossed_line_ids, crossed_classes, penalty_class, crossing_cost_m
+            FROM {ref.fqn}
+            ORDER BY blockface_id_a, blockface_id_b, COALESCE(node_id, '')
+        """).fetchall()
+        assert self._signature(west_rows) == self._signature(nyc_rows)
+        assert len(west_rows) == 32
+
+    @staticmethod
+    def _strip(rows, prefix):
+        """The rows with `prefix` removed from every blockface, node, and line id."""
+        strip = lambda v: v.removeprefix(prefix) if isinstance(v, str) else v  # noqa: E731
+        return [(strip(r[0]), strip(r[1]), r[2], strip(r[3]), [strip(x) for x in r[4]], *r[5:]) for r in rows]
+
+    def test_two_coast_catalog_projects_each_node_in_its_own_zone(self, dual_conn):
+        """The NYC plus-sign and a Los Angeles copy share one catalog, 44° of
+        longitude apart — more than one UTM zone can serve. With no
+        `bearing_epsg`, each node is measured in the zone of its own longitude
+        (18 for New York, 11 for Los Angeles), so the run neither refuses the
+        span nor mis-scales either coast, and each plus-sign classifies
+        exactly as it does alone."""
+        nyc = _build_geo_tables(dual_conn, CENTER)
+        alone = self._signature(_run(dual_conn, nyc))
+        _build_geo_tables(dual_conn, WEST_COAST, prefix="CA_", create=False)
+        rows = _run(dual_conn, nyc)
+
+        # The per-node zone table outlives the call on the connection: two
+        # zones were sampled, and the catalog's longitudes are ones a single
+        # zone would refuse.
+        zones = {z for (z,) in dual_conn.execute("SELECT DISTINCT zone FROM _bfrel_ends").fetchall()}
+        assert zones == {11, 18}
+        lons = [lon for (lon,) in dual_conn.execute("SELECT node_lon FROM _bfrel_ends").fetchall()]
+        with pytest.raises(ValueError, match="one UTM zone cannot serve it"):
+            utm_epsg_for_longitudes(statistics.median(lons), min(lons), max(lons), label="catalog")
+
+        assert len(rows) == 64
+        east = [r for r in rows if not r[0].startswith("CA_")]
+        west = [r for r in rows if r[0].startswith("CA_")]
+        assert self._signature(east) == alone
+        assert self._signature(self._strip(west, "CA_")) == alone
