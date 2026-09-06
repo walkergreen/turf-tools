@@ -581,3 +581,12 @@ Writes one PNG per module (`voter_file_loader_graph.png`, `tiger_graph.png`,
 `assembly_graph.png`, `aggregate_graph.png`, `boundaries_graph.png`,
 `quickwit_graph.png`) plus a combined `pipeline_graph.png` into `docs/`.
 Graphviz must be installed (`brew install graphviz`).
+
+## Voter data in queries
+
+See the root `AGENTS.md` for the general rule. Specific to this package:
+
+- `ducklake` holds per-organization Person data. Any `SELECT *` against `persons_validated`, the Person / Building / Door tables, or an address-matched intermediate returns row-level PII straight to the terminal.
+- Inspect the DAG with schema reads and aggregates: `DESCRIBE`, `COUNT(*)`, `GROUP BY` on non-identity columns, null-rate checks. That answers almost every pipeline question.
+- When a node's output must be eyeballed row by row, write it to Parquet or CSV and open it outside the session rather than printing it.
+- `ducklake_geo` (TIGER blockfaces, OSM buildings, landuse, boundaries) carries no person data and is fine to query freely. The catalog is the line.
