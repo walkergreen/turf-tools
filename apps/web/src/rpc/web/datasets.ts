@@ -23,7 +23,9 @@ function slugify(name: string): string {
 
 // Every version the org can see, as flat rows (dataset identity + version),
 // newest first within each dataset. `isActive` marks the single version the org
-// is currently working against (`organizations.activeDatasetVersionId`).
+// is currently working against (`organizations.activeDatasetVersionId`). The
+// grant's Compliance provenance rides along on every row of its dataset (null
+// unless the grant came through the service API).
 export const list = pub.input(z.object({}).optional()).handler(async ({ context }) => {
   const [org] = await context.db
     .select({ activeDatasetVersionId: organizations.activeDatasetVersionId })
@@ -47,6 +49,9 @@ export const list = pub.input(z.object({}).optional()).handler(async ({ context 
       archivedAt: datasetVersions.archivedAt,
       importStep: datasetVersions.importStep,
       importTotalSteps: datasetVersions.importTotalSteps,
+      approvalTicketId: datasetOrganizations.approvalTicketId,
+      approvedAt: datasetOrganizations.approvedAt,
+      contributionReportedAt: datasetOrganizations.contributionReportedAt,
     })
     .from(datasetOrganizations)
     .innerJoin(datasets, eq(datasets.datasetId, datasetOrganizations.datasetId))

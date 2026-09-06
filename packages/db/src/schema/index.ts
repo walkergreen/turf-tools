@@ -8,6 +8,7 @@ export * from "./memberships";
 export * from "./campaigns";
 export * from "./datasets";
 export * from "./dataset-organizations";
+export * from "./service-tokens";
 export * from "./questions";
 export * from "./scripts";
 export * from "./segments";

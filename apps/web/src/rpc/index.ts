@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { webPub, nativePub } from "./context";
+import { webPub, nativePub, servicePub } from "./context";
 import * as campaigns from "./web/campaigns";
 import * as datasets from "./web/datasets";
 import * as persons from "./web/persons";
@@ -20,6 +20,10 @@ import * as canvass from "./native/canvass";
 import * as nativeWalks from "./native/walks";
 import * as nativeScripts from "./native/scripts";
 import * as nativeTurfs from "./native/turfs";
+import * as serviceDatasets from "./service/datasets";
+import * as serviceOrganizations from "./service/organizations";
+import * as serviceQuestions from "./service/questions";
+import * as serviceUsers from "./service/users";
 
 export const webRouter = {
   healthcheck: webPub.input(z.object({}).optional()).handler(async ({ context }) => {
@@ -202,5 +206,33 @@ export const nativeRouter = {
   },
 };
 
+// Bearer-token surface for automation, served as plain JSON at
+// `/api/service/<path>` (see routes/api/service.$.ts). Paths are declared per
+// procedure so the wire contract is visible here, not derived from nesting.
+export const serviceRouter = {
+  healthcheck: servicePub
+    .route({ path: "/healthcheck" })
+    .input(z.object({}).optional())
+    .handler(async ({ context }) => {
+      await context.db.execute("SELECT 1 as ok");
+      return { status: "ok", db: "connected", token: { name: context.token.name } };
+    }),
+  organizations: {
+    status: serviceOrganizations.status,
+    ensure: serviceOrganizations.ensure,
+  },
+  datasets: {
+    list: serviceDatasets.list,
+    grant: serviceDatasets.grant,
+  },
+  users: {
+    invite: serviceUsers.invite,
+  },
+  questions: {
+    create: serviceQuestions.create,
+  },
+};
+
 export type WebRouter = typeof webRouter;
 export type NativeRouter = typeof nativeRouter;
+export type ServiceRouter = typeof serviceRouter;

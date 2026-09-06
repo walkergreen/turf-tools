@@ -39,6 +39,8 @@
     "images:push:data": "bash deploy/build-images.sh --only data",
     "org:create": "pnpm -F @turf-tools/scripts exec tsx prod-create-org.ts",
     "org:add-user": "pnpm -F @turf-tools/scripts exec tsx prod-add-user.ts",
+    "service-token:create": "pnpm -F @turf-tools/scripts exec tsx prod-create-service-token.ts",
+    "service-token:revoke": "pnpm -F @turf-tools/scripts exec tsx prod-revoke-service-token.ts",
     "bench": "pnpm -F @turf-tools/scripts exec tsx bench/bench.ts",
     "swarm": "pnpm -F @turf-tools/scripts exec tsx swarm/swarm.ts",
     "bench:report": "pnpm -F @turf-tools/scripts exec tsx bench/report.ts",
